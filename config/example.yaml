@@ -1,0 +1,47 @@
+version: 1
+timezone: Asia/Shanghai
+archive_policy:
+  archive_after_years: 2
+  cutoff_date: null
+  media_types: [image, video, live_photo]
+  batch_size: 100
+storage:
+  database_path: ./var/photoarchive.sqlite3
+  staging_root: ./var/staging
+  fake_archive_root: ./var/fake-archive
+  reports_root: ./var/reports
+media_helper:
+  helper_path: ./native/photos-helper/build/PhotoArchiveMediaHelper.app/Contents/MacOS/photos-helper
+folder_import:
+  inbox_root: ~/Pictures/PhotoArchiveInbox
+  stable_poll_count: 2
+  stable_poll_interval_sec: 2
+  open_image_capture: true
+phone_cleanup:
+  enabled: false
+  confirmation_mode: per_batch
+  discovery_timeout_sec: 15
+  command_timeout_sec: 600
+  delete_batch_size: 50
+icloud_cleanup:
+  enabled: false
+  confirmation_mode: per_batch
+  command_timeout_sec: 3600
+external_drive:
+  volume_path: /Volumes/ExternalDisk01
+  archive_directory: PhotoArchive
+  expected_volume_name: ExternalDisk01
+  expected_volume_uuid: DBA7A3B4-A89B-4F68-8F29-2727F81FAB87
+  minimum_free_bytes: 5368709120
+verification:
+  stable_poll_count: 2
+  stable_poll_interval_sec: 30
+retry:
+  max_attempts: 8
+  base_delay_sec: 5
+  max_delay_sec: 900
+safety:
+  automatic_photos_delete: false
+  automatic_source_delete: false
+  allow_remote_overwrite: false
+  source_finalize_mode: move_to_completed
