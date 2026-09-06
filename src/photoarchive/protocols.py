@@ -17,6 +17,7 @@ from photoarchive.domain import (
     PhotoLibraryDeleteResult,
     PhotoLibraryRevalidation,
     PhotoLibraryScan,
+    PhotoLibrarySizeProbe,
     RemoteObject,
     UploadRequest,
 )
@@ -74,6 +75,15 @@ class PhoneClient(Protocol):
 class PhotoLibrarySession(Protocol):
     def scan(self, cutoff_at_utc: str, media_types: frozenset[str]) -> PhotoLibraryScan: ...
 
+    def scan_large_videos(self) -> PhotoLibraryScan: ...
+
+    def probe_resource_size(
+        self,
+        asset: PhotoLibraryAsset,
+        resource_key: str,
+        threshold_bytes: int,
+    ) -> PhotoLibrarySizeProbe: ...
+
     def download(self, asset: PhotoLibraryAsset, resource_key: str, partial_path: Path) -> int: ...
 
     def revalidate(
@@ -81,6 +91,7 @@ class PhotoLibrarySession(Protocol):
         assets: tuple[PhotoLibraryAsset, ...],
         *,
         cutoff_at_utc: str,
+        selection_mode: str = "age_cutoff",
     ) -> PhotoLibraryRevalidation: ...
 
     def delete(
@@ -90,6 +101,7 @@ class PhotoLibrarySession(Protocol):
         batch_id: str,
         cutoff_at_utc: str,
         plan_sha256: str,
+        selection_mode: str = "age_cutoff",
     ) -> PhotoLibraryDeleteResult: ...
 
     def close(self) -> None: ...

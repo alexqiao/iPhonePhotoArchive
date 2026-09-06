@@ -244,6 +244,13 @@ class PhotoLibraryScan:
 
 
 @dataclass(frozen=True, slots=True)
+class PhotoLibrarySizeProbe:
+    observed_bytes: int
+    complete: bool
+    exceeds_threshold: bool
+
+
+@dataclass(frozen=True, slots=True)
 class PhotoLibraryRevalidation:
     valid_local_identifiers: tuple[str, ...]
     missing_local_identifiers: tuple[str, ...]

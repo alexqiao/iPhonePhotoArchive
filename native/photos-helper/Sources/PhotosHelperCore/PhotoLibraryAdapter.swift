@@ -38,6 +38,37 @@ private final class ResultBox<Value>: @unchecked Sendable {
     }
 }
 
+private final class ResourceProbeState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var byteCount = 0
+    private var exceeded = false
+    private var requestID: PHAssetResourceDataRequestID?
+
+    func add(_ count: Int, threshold: Int) -> PHAssetResourceDataRequestID? {
+        lock.lock()
+        defer { lock.unlock() }
+        byteCount += count
+        if byteCount > threshold {
+            exceeded = true
+            return requestID
+        }
+        return nil
+    }
+
+    func setRequestID(_ value: PHAssetResourceDataRequestID) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        requestID = value
+        return exceeded
+    }
+
+    func result() -> (bytes: Int, exceeded: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (byteCount, exceeded)
+    }
+}
+
 private struct LibraryResourceDescriptor: Sendable {
     let resourceKey: String
     let resourceType: String
@@ -266,6 +297,140 @@ public final class PhotoLibrarySession {
         )
     }
 
+    public func discoverLargeVideos() throws -> PhotoLibraryDiscoveryResponse {
+        let status = try ensureAuthorization()
+        let fetched = PHAsset.fetchAssets(with: fetchOptions())
+        var totalResources = 0
+        var skippedMissingDate = 0
+        var missingOriginalVideo = 0
+        var candidates: [[String: JSONValue]] = []
+        candidates.reserveCapacity(fetched.count)
+        for index in 0..<fetched.count {
+            let asset = fetched.object(at: index)
+            let descriptors = resourceDescriptors(asset)
+            totalResources += descriptors.count
+            guard asset.mediaType == .video else { continue }
+            let creationDate: Date
+            if let recordedDate = asset.creationDate {
+                creationDate = recordedDate
+            } else {
+                skippedMissingDate += 1
+                creationDate = asset.modificationDate ?? Date(timeIntervalSince1970: 0)
+            }
+            if !descriptors.contains(where: { $0.resourceTypeCode == 2 }) {
+                missingOriginalVideo += 1
+            }
+            candidates.append([
+                "local_identifier": .string(asset.localIdentifier),
+                "creation_at_utc": .string(iso8601LibraryDate(creationDate)),
+                "media_type": .string("video"),
+                "resources": .array(descriptors.map { .object($0.payload) }),
+            ])
+        }
+        var warnings: [JSONValue] = []
+        if skippedMissingDate > 0 {
+            warnings.append(.string("MISSING_CREATION_DATE:\(skippedMissingDate)"))
+        }
+        if missingOriginalVideo > 0 {
+            warnings.append(.string("MISSING_ORIGINAL_VIDEO_RESOURCE:\(missingOriginalVideo)"))
+        }
+        return PhotoLibraryDiscoveryResponse(
+            assets: candidates,
+            result: [
+                "authorization": .string(authorizationName(status)),
+                "total_assets": .integer(fetched.count),
+                "total_resources": .integer(totalResources),
+                "candidate_assets": .integer(candidates.count),
+                "candidate_resources": .integer(candidates.reduce(0) { total, asset in
+                    total + (asset["resources"]?.arrayValue?.count ?? 0)
+                }),
+                "warnings": .array(warnings),
+            ]
+        )
+    }
+
+    private func selectedResource(
+        localIdentifier: String,
+        resourceKey: String
+    ) throws -> (PHAsset, PHAssetResource, LibraryResourceDescriptor) {
+        let fetched = PHAsset.fetchAssets(withLocalIdentifiers: [localIdentifier], options: nil)
+        guard fetched.count == 1 else {
+            throw PhotoLibraryAdapterError.unavailable("The requested Photos asset is missing.")
+        }
+        let asset = fetched.object(at: 0)
+        let resources = PHAssetResource.assetResources(for: asset)
+        let descriptors = resourceDescriptors(asset)
+        guard let descriptor = descriptors.first(where: { $0.resourceKey == resourceKey }) else {
+            throw PhotoLibraryAdapterError.unsafe("The requested Photos resource changed.")
+        }
+        var occurrence = 0
+        for resource in resources {
+            guard resource.type.rawValue == descriptor.resourceTypeCode,
+                  resource.originalFilename == descriptor.originalName,
+                  resource.uniformTypeIdentifier == descriptor.uti
+            else { continue }
+            if occurrence == descriptor.ordinal {
+                return (asset, resource, descriptor)
+            }
+            occurrence += 1
+        }
+        throw PhotoLibraryAdapterError.unsafe("The requested Photos resource changed.")
+    }
+
+    public func probeResourceSize(payload: [String: JSONValue]) throws -> [String: JSONValue] {
+        _ = try ensureAuthorization()
+        guard let localIdentifier = payload["local_identifier"]?.stringValue,
+              let resourceKey = payload["resource_key"]?.stringValue,
+              let threshold = payload["threshold_bytes"]?.integerValue,
+              threshold > 0
+        else {
+            throw PhotoLibraryAdapterError.invalidRequest(
+                "probe-resource-size requires an asset, resource, and positive threshold"
+            )
+        }
+        let (asset, resource, descriptor) = try selectedResource(
+            localIdentifier: localIdentifier,
+            resourceKey: resourceKey
+        )
+        guard asset.mediaType == .video, descriptor.resourceTypeCode == 2 else {
+            throw PhotoLibraryAdapterError.unsafe(
+                "Only an original resource from a video asset can be size-probed."
+            )
+        }
+        let options = PHAssetResourceRequestOptions()
+        options.isNetworkAccessAllowed = true
+        let errorBox = ResultBox<Error?>(nil)
+        let state = ResourceProbeState()
+        let semaphore = DispatchSemaphore(value: 0)
+        let manager = PHAssetResourceManager.default()
+        let requestID = manager.requestData(
+            for: resource,
+            options: options,
+            dataReceivedHandler: { data in
+                if let identifier = state.add(data.count, threshold: threshold) {
+                    manager.cancelDataRequest(identifier)
+                }
+            },
+            completionHandler: { error in
+                errorBox.set(error)
+                semaphore.signal()
+            }
+        )
+        if state.setRequestID(requestID) {
+            manager.cancelDataRequest(requestID)
+        }
+        semaphore.wait()
+        let result = state.result()
+        if !result.exceeded, let error = errorBox.get() {
+            throw PhotoLibraryAdapterError.unavailable(error.localizedDescription)
+        }
+        return [
+            "observed_bytes": .integer(result.bytes),
+            "complete": .boolean(!result.exceeded),
+            "exceeds_threshold": .boolean(result.exceeded),
+        ]
+    }
+
     public func download(payload: [String: JSONValue]) throws -> [String: JSONValue] {
         _ = try ensureAuthorization()
         guard let localIdentifier = payload["local_identifier"]?.stringValue,
@@ -277,34 +442,10 @@ public final class PhotoLibrarySession {
                 "download requires local_identifier, resource_key, and path"
             )
         }
-        let fetched = PHAsset.fetchAssets(withLocalIdentifiers: [localIdentifier], options: nil)
-        guard fetched.count == 1 else {
-            throw PhotoLibraryAdapterError.unavailable("The requested Photos asset is missing.")
-        }
-        let asset = fetched.object(at: 0)
-        let resources = PHAssetResource.assetResources(for: asset)
-        let descriptors = resourceDescriptors(asset)
-        guard let descriptorIndex = descriptors.firstIndex(where: { $0.resourceKey == resourceKey })
-        else {
-            throw PhotoLibraryAdapterError.unsafe("The requested Photos resource changed.")
-        }
-        let descriptor = descriptors[descriptorIndex]
-        var occurrence = 0
-        var selected: PHAssetResource?
-        for resource in resources {
-            guard resource.type.rawValue == descriptor.resourceTypeCode,
-                  resource.originalFilename == descriptor.originalName,
-                  resource.uniformTypeIdentifier == descriptor.uti
-            else { continue }
-            if occurrence == descriptor.ordinal {
-                selected = resource
-                break
-            }
-            occurrence += 1
-        }
-        guard let selected else {
-            throw PhotoLibraryAdapterError.unsafe("The requested Photos resource changed.")
-        }
+        let (_, selected, _) = try selectedResource(
+            localIdentifier: localIdentifier,
+            resourceKey: resourceKey
+        )
         let destination = URL(fileURLWithPath: path)
         guard !FileManager.default.fileExists(atPath: destination.path) else {
             throw PhotoLibraryAdapterError.unsafe("The download destination already exists.")
@@ -337,13 +478,14 @@ public final class PhotoLibrarySession {
         _ = try ensureAuthorization()
         guard let cutoffText = payload["cutoff_at_utc"]?.stringValue,
               let cutoff = parseLibraryDate(cutoffText),
+              let selectionMode = selectionMode(payload),
               let requested = try? requestedAssets(payload)
         else {
             throw PhotoLibraryAdapterError.invalidRequest(
                 "revalidate requires cutoff_at_utc and assets"
             )
         }
-        let validated = validate(requested, cutoff: cutoff)
+        let validated = validate(requested, cutoff: cutoff, selectionMode: selectionMode)
         return [
             "valid_local_identifiers": .array(validated.valid.map(JSONValue.string)),
             "missing_local_identifiers": .array(validated.missing.map(JSONValue.string)),
@@ -358,12 +500,13 @@ public final class PhotoLibrarySession {
               planSHA256.count == 64,
               let cutoffText = payload["cutoff_at_utc"]?.stringValue,
               let cutoff = parseLibraryDate(cutoffText),
+              let selectionMode = selectionMode(payload),
               let requested = try? requestedAssets(payload),
               !requested.isEmpty
         else {
             throw PhotoLibraryAdapterError.invalidRequest("delete request is incomplete")
         }
-        let validated = validate(requested, cutoff: cutoff)
+        let validated = validate(requested, cutoff: cutoff, selectionMode: selectionMode)
         guard validated.valid.count == requested.count,
               validated.missing.isEmpty,
               validated.mismatched.isEmpty
@@ -415,7 +558,16 @@ public final class PhotoLibrarySession {
         }
     }
 
-    private func validate(_ requested: [RequestedAsset], cutoff: Date) -> ValidatedAssets {
+    private func selectionMode(_ payload: [String: JSONValue]) -> String? {
+        let mode = payload["selection_mode"]?.stringValue ?? "age_cutoff"
+        return ["age_cutoff", "large_video"].contains(mode) ? mode : nil
+    }
+
+    private func validate(
+        _ requested: [RequestedAsset],
+        cutoff: Date,
+        selectionMode: String
+    ) -> ValidatedAssets {
         let identifiers = requested.map(\.localIdentifier)
         let fetched = PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil)
         var current: [String: PHAsset] = [:]
@@ -433,10 +585,14 @@ public final class PhotoLibrarySession {
                 continue
             }
             let keys = Set(resourceDescriptors(asset).map(\.resourceKey))
-            guard let creationDate = asset.creationDate,
-                  creationDate < cutoff,
-                  keys == item.resourceKeys,
-                  mediaTypeName(asset) != nil
+            let selectionMatches: Bool
+            if selectionMode == "large_video" {
+                selectionMatches = asset.mediaType == .video
+            } else {
+                selectionMatches = asset.creationDate.map { $0 < cutoff } == true
+                    && mediaTypeName(asset) != nil
+            }
+            guard selectionMatches, keys == item.resourceKeys
             else {
                 mismatched.append(item.localIdentifier)
                 continue

@@ -1,6 +1,6 @@
 # PhotoArchive
 
-PhotoArchive 可以从两类来源归档超过两年的照片和视频：USB 连接的 iPhone，以及 Mac 系统“照片”图库中的完整 iCloud Photos 资产。外接盘验证成功并经你确认后，它可以删除来源中精确对应的旧资产。它不需要微软账号。
+PhotoArchive 可以从两类来源归档超过两年的照片和视频：USB 连接的 iPhone，以及 Mac 系统“照片”图库中的完整 iCloud Photos 资产。它还可以从 iCloud Photos 单独迁移不限拍摄时间、原始文件超过 100 MiB 的视频。外接盘验证成功并经你确认后，它可以删除来源中精确对应的资产。它不需要微软账号。
 
 归档成功后，程序会核对文件大小、SHA-256、QuickXorHash，并执行两次稳定性检查。删除前，它还会重新核对人员、截止日、资产身份和完整资源集合。任何资源缺失、身份不明确或验证失败都会阻止删除。
 
@@ -57,6 +57,18 @@ PhotoKit 没有公开、无需下载即可读取每个云端原件字节数的�
 `icloud sync` 是白天交互模式：每次最多处理 `icloud_cleanup.batch_size`
 个资产（默认 1000），完成归档与验证后显示该批删除计划并等待一次人工确认。
 
+需要一次确认后自动处理全部候选时，使用完整流水线：
+
+```bash
+caffeinate -dimsu .venv/bin/photoarchive --config config/local.yaml \
+  icloud sync-all --profile wife
+```
+
+`sync-all` 会冻结启动时扫描到的候选集合并显示授权范围 SHA-256。确认一次后，它先清理
+已有的验证队列、恢复可安全续传的小批次，再循环执行“归档最多 1000 项 → 删除前完整
+复核 → 删除该批 → 下一批”。运行期间新增的照片不会被纳入；任何归档、复核或删除失败
+都会立即停止，重新运行时必须重新扫描并确认。
+
 夜间无人值守时只归档和验证，不删除系统照片：
 
 ```bash
@@ -67,7 +79,8 @@ PhotoKit 没有公开、无需下载即可读取每个云端原件字节数的�
 最多 1000 个资产的 PhotoKit 事务依次删除：
 
 ```bash
-.venv/bin/photoarchive --config config/local.yaml icloud cleanup-ready --profile wife
+caffeinate -dimsu .venv/bin/photoarchive --config config/local.yaml \
+  icloud cleanup-ready --profile wife
 ```
 
 夜间命令不会接受预先授权或自动确认删除，因为最终文件哈希和删除计划只有在
@@ -95,6 +108,51 @@ PhotoKit 没有公开、无需下载即可读取每个云端原件字节数的�
 PhotoKit 删除会同步影响使用同一 Apple Account 的所有设备，并先把资产移入“最近删除”。程序永远不会自动清空“最近删除”。如果目标是立即释放 iCloud 空间，请在确认外接盘归档和报告无误后，亲自在“照片”App 的“最近删除”中永久删除。
 
 iCloud 报告位于 `var/reports/<batch_id>/report.json` 和 `icloud_cleanup.csv`。归档保存的是原件、PhotoKit 暴露的资源和 manifest，不是完整 Photos Library 克隆；相簿层级、人物识别和共享互动信息不能靠这些文件自动恢复。
+
+## 迁移不限时间的大视频
+
+大视频流程与“两年前”流程相互独立。它只选择系统“照片”图库中原始视频严格大于
+100 MiB（104857600 字节）的视频资产，不限制拍摄时间；Live Photo 的配对短视频不会
+被当作大视频。资产入选后，程序仍会归档 PhotoKit 暴露的全部关联资源。
+
+先做只读元数据扫描：
+
+```bash
+.venv/bin/photoarchive --config config/local.yaml \
+  icloud large-video scan --profile wife
+```
+
+PhotoKit 没有公开的云端原件大小字段，因此这个扫描不会下载视频。输出会区分已经缓存的
+大视频、未超过阈值的视频和仍待测量的视频。大小测量只在下面两个归档命令中发生；测量
+结果会写入本地数据库，后续运行不会重复读取同一个未变化的原始资源。
+
+白天处理一个有界批次，归档验证后确认是否从整个 iCloud Photos 图库删除：
+
+```bash
+caffeinate -dimsu .venv/bin/photoarchive --config config/local.yaml \
+  icloud large-video sync --profile wife
+```
+
+一次确认后按批处理全部符合条件的大视频：
+
+```bash
+caffeinate -dimsu .venv/bin/photoarchive --config config/local.yaml \
+  icloud large-video sync-all --profile wife
+```
+
+该命令同样先冻结候选范围，再逐批归档、验证和删除。历史大视频批次继续使用各自固化的
+阈值，新候选使用当前配置的阈值；任一批失败都会停止后续处理。
+
+夜间测量并归档全部剩余大视频，但不删除照片图库中的资产：
+
+```bash
+caffeinate -dimsu .venv/bin/photoarchive --config config/local.yaml \
+  icloud large-video archive-night --profile wife
+```
+
+第二天仍使用通用的 `icloud cleanup-ready --profile wife` 汇总确认并清理。大小判断采用
+严格大于；恰好 100 MiB 的视频不会入选。阈值可以通过配置项
+`archive_policy.large_video_threshold_bytes` 调整，并会固化到对应批次及删除计划中。
 
 ## 第一次使用
 

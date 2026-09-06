@@ -19,6 +19,7 @@ from photoarchive.domain import (
     PhotoLibraryResource,
     PhotoLibraryRevalidation,
     PhotoLibraryScan,
+    PhotoLibrarySizeProbe,
 )
 
 
@@ -114,7 +115,7 @@ class SwiftPhotoLibrarySession:
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         request_id = str(uuid.uuid4())
         request = {
-            "schema_version": 3,
+            "schema_version": 4,
             "type": "request",
             "request_id": request_id,
             "payload": {"command": command, **(payload or {})},
@@ -171,6 +172,41 @@ class SwiftPhotoLibrarySession:
             warnings=tuple(str(item) for item in result.get("warnings", [])),
         )
 
+    def scan_large_videos(self) -> PhotoLibraryScan:
+        records, result = self._exchange("discover-large-videos")
+        assets = tuple(
+            _asset(cast(dict[str, Any], record["payload"]))
+            for record in records
+            if record.get("type") == "asset"
+        )
+        return PhotoLibraryScan(
+            authorization=str(result.get("authorization") or "unknown"),
+            assets=assets,
+            total_assets=int(result.get("total_assets", 0)),
+            total_resources=int(result.get("total_resources", 0)),
+            warnings=tuple(str(item) for item in result.get("warnings", [])),
+        )
+
+    def probe_resource_size(
+        self,
+        asset: PhotoLibraryAsset,
+        resource_key: str,
+        threshold_bytes: int,
+    ) -> PhotoLibrarySizeProbe:
+        _, result = self._exchange(
+            "probe-resource-size",
+            {
+                "local_identifier": asset.local_identifier,
+                "resource_key": resource_key,
+                "threshold_bytes": threshold_bytes,
+            },
+        )
+        return PhotoLibrarySizeProbe(
+            observed_bytes=int(result["observed_bytes"]),
+            complete=bool(result["complete"]),
+            exceeds_threshold=bool(result["exceeds_threshold"]),
+        )
+
     def download(
         self, asset: PhotoLibraryAsset, resource_key: str, partial_path: Path
     ) -> int:
@@ -189,11 +225,13 @@ class SwiftPhotoLibrarySession:
         assets: tuple[PhotoLibraryAsset, ...],
         *,
         cutoff_at_utc: str,
+        selection_mode: str = "age_cutoff",
     ) -> PhotoLibraryRevalidation:
         _, result = self._exchange(
             "revalidate",
             {
                 "cutoff_at_utc": cutoff_at_utc,
+                "selection_mode": selection_mode,
                 "assets": [_asset_reference(asset) for asset in assets],
             },
         )
@@ -210,6 +248,7 @@ class SwiftPhotoLibrarySession:
         batch_id: str,
         cutoff_at_utc: str,
         plan_sha256: str,
+        selection_mode: str = "age_cutoff",
     ) -> PhotoLibraryDeleteResult:
         _, result = self._exchange(
             "delete",
@@ -217,6 +256,7 @@ class SwiftPhotoLibrarySession:
                 "batch_id": batch_id,
                 "cutoff_at_utc": cutoff_at_utc,
                 "plan_sha256": plan_sha256,
+                "selection_mode": selection_mode,
                 "assets": [_asset_reference(asset) for asset in assets],
             },
         )

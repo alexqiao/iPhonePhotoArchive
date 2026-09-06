@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import batched
@@ -37,6 +38,21 @@ class ICloudScanSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class LargeVideoScanSummary:
+    authorization: str
+    total_assets: int
+    total_resources: int
+    total_video_assets: int
+    archived_assets: int
+    measured_large_assets: int
+    measured_not_large_assets: int
+    pending_measurement_assets: int
+    unmeasurable_assets: int
+    threshold_bytes: int
+    warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ArchivedICloudBatch:
     batch_id: str
     job_id: str
@@ -51,6 +67,60 @@ class ICloudCleanupPlan:
     plan_sha256: str
     assets: tuple[PhotoLibraryAsset, ...]
     total_bytes: int
+    selection_mode: str = "age_cutoff"
+    selection_threshold_bytes: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ICloudPipelineCleanupChunk:
+    batch_id: str
+    local_identifiers: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ICloudPipelineResumeBatch:
+    batch_id: str
+    local_identifiers: tuple[str, ...]
+    incomplete_assets: int
+
+
+@dataclass(frozen=True, slots=True)
+class ICloudPipelineScope:
+    profile_id: str
+    selection_mode: str
+    cutoff_at_utc: str
+    selection_threshold_bytes: int | None
+    batch_size: int
+    cleanup_chunks: tuple[ICloudPipelineCleanupChunk, ...]
+    resume_batches: tuple[ICloudPipelineResumeBatch, ...]
+    new_scan: PhotoLibraryScan
+    authorization_sha256: str
+    historical_thresholds: tuple[int, ...] = ()
+
+    @property
+    def ready_assets(self) -> int:
+        return sum(len(chunk.local_identifiers) for chunk in self.cleanup_chunks)
+
+    @property
+    def resume_assets(self) -> int:
+        return sum(len(batch.local_identifiers) for batch in self.resume_batches)
+
+    @property
+    def new_assets(self) -> int:
+        return len(self.new_scan.assets)
+
+    @property
+    def authorized_assets(self) -> int:
+        return self.ready_assets + self.resume_assets + self.new_assets
+
+
+@dataclass(frozen=True, slots=True)
+class ICloudPipelineResult:
+    batch_ids: tuple[str, ...]
+    completed_chunks: int
+    archived_assets: int
+    deleted: int
+    failed: int
 
 
 ProgressCallback = Any
@@ -73,6 +143,10 @@ class ICloudWorkflow:
     def _progress(self, event: str, **details: Any) -> None:
         if self.progress is not None:
             self.progress(event, details)
+
+    @staticmethod
+    def _short_asset_key(local_identifier: str) -> str:
+        return hashlib.sha256(local_identifier.encode()).hexdigest()[:8]
 
     def _cutoff(self) -> str:
         return self.config.cutoff_at_utc().isoformat().replace("+00:00", "Z")
@@ -110,6 +184,158 @@ class ICloudWorkflow:
         )
         return scan, summary
 
+    def scan_large_videos(
+        self, profile_id: str, session: PhotoLibrarySession | None = None
+    ) -> tuple[PhotoLibraryScan, LargeVideoScanSummary]:
+        self.database.get_profile(profile_id)
+        owns_session = session is None
+        active = session or self.client.open_session()
+        self._progress("ICLOUD_LARGE_VIDEO_SCAN_STARTED", profile_id=profile_id)
+        try:
+            scan = active.scan_large_videos()
+        finally:
+            if owns_session:
+                active.close()
+        scan = PhotoLibraryScan(
+            authorization=scan.authorization,
+            assets=tuple(asset for asset in scan.assets if asset.media_type == "video"),
+            total_assets=scan.total_assets,
+            total_resources=scan.total_resources,
+            warnings=scan.warnings,
+        )
+        threshold = self.config.archive_policy.large_video_threshold_bytes
+        measurements = self.database.icloud_video_measurements(profile_id, threshold)
+        archived = self.database.verified_icloud_local_ids(profile_id)
+        large = 0
+        not_large = 0
+        pending = 0
+        unmeasurable = 0
+        for asset in scan.assets:
+            if asset.local_identifier in archived:
+                continue
+            originals = self._original_video_resources(asset)
+            if not originals:
+                unmeasurable += 1
+                continue
+            rows = [
+                measurements.get((asset.local_identifier, resource.resource_key))
+                for resource in originals
+            ]
+            if any(row is not None and bool(row["exceeds_threshold"]) for row in rows):
+                large += 1
+            elif all(row is not None for row in rows):
+                not_large += 1
+            else:
+                pending += 1
+        summary = LargeVideoScanSummary(
+            authorization=scan.authorization,
+            total_assets=scan.total_assets,
+            total_resources=scan.total_resources,
+            total_video_assets=len(scan.assets),
+            archived_assets=sum(
+                asset.local_identifier in archived for asset in scan.assets
+            ),
+            measured_large_assets=large,
+            measured_not_large_assets=not_large,
+            pending_measurement_assets=pending,
+            unmeasurable_assets=unmeasurable,
+            threshold_bytes=threshold,
+            warnings=scan.warnings,
+        )
+        self._progress(
+            "ICLOUD_LARGE_VIDEO_SCAN_COMPLETED",
+            videos=summary.total_video_assets,
+            large=large,
+            pending=pending,
+            threshold_bytes=threshold,
+        )
+        return scan, summary
+
+    def select_large_videos(
+        self,
+        profile_id: str,
+        session: PhotoLibrarySession,
+        scan: PhotoLibraryScan,
+        *,
+        limit: int | None = None,
+    ) -> PhotoLibraryScan:
+        threshold = self.config.archive_policy.large_video_threshold_bytes
+        measurements = self.database.icloud_video_measurements(profile_id, threshold)
+        archived = self.database.verified_icloud_local_ids(profile_id)
+        selected: list[PhotoLibraryAsset] = []
+        candidates = sorted(
+            (
+                asset
+                for asset in scan.assets
+                if asset.local_identifier not in archived and asset.media_type == "video"
+            ),
+            key=lambda asset: (asset.creation_at_utc, asset.local_identifier),
+        )
+        for position, asset in enumerate(candidates, start=1):
+            originals = self._original_video_resources(asset)
+            if not originals:
+                self._progress(
+                    "ICLOUD_LARGE_VIDEO_UNMEASURABLE",
+                    asset_key=self._short_asset_key(asset.local_identifier),
+                    reason="MISSING_ORIGINAL_VIDEO_RESOURCE",
+                )
+                continue
+            is_large = False
+            for resource in originals:
+                row = measurements.get((asset.local_identifier, resource.resource_key))
+                if row is None:
+                    self._progress(
+                        "ICLOUD_LARGE_VIDEO_MEASURE_STARTED",
+                        current=position,
+                        total=len(candidates),
+                        asset_key=self._short_asset_key(asset.local_identifier),
+                    )
+                    probe = session.probe_resource_size(
+                        asset,
+                        resource.resource_key,
+                        threshold,
+                    )
+                    self.database.record_icloud_video_measurement(
+                        profile_id,
+                        asset.local_identifier,
+                        resource.resource_key,
+                        threshold,
+                        observed_bytes=probe.observed_bytes,
+                        complete=probe.complete,
+                        exceeds_threshold=probe.exceeds_threshold,
+                    )
+                    exceeds = probe.exceeds_threshold
+                    self._progress(
+                        "ICLOUD_LARGE_VIDEO_MEASURE_COMPLETED",
+                        current=position,
+                        total=len(candidates),
+                        asset_key=self._short_asset_key(asset.local_identifier),
+                        exceeds_threshold=exceeds,
+                        observed_bytes=probe.observed_bytes,
+                    )
+                else:
+                    exceeds = bool(row["exceeds_threshold"])
+                if exceeds:
+                    is_large = True
+                    break
+            if is_large:
+                selected.append(asset)
+                if limit is not None and len(selected) >= limit:
+                    break
+        return PhotoLibraryScan(
+            authorization=scan.authorization,
+            assets=tuple(selected),
+            total_assets=scan.total_assets,
+            total_resources=scan.total_resources,
+            warnings=scan.warnings,
+        )
+
+    @staticmethod
+    def _original_video_resources(
+        asset: PhotoLibraryAsset,
+    ) -> tuple[PhotoLibraryResource, ...]:
+        return tuple(resource for resource in asset.resources if resource.resource_type_code == 2)
+
     def archive_scan(
         self,
         profile_id: str,
@@ -117,9 +343,17 @@ class ICloudWorkflow:
         scan: PhotoLibraryScan,
         *,
         candidate_limit: int | None = None,
+        selection_mode: str = "age_cutoff",
+        selection_threshold_bytes: int | None = None,
     ) -> ArchivedICloudBatch:
         if not self.config.icloud_cleanup.enabled:
             raise PhoneSafetyError("iCloud cleanup is disabled in configuration")
+        if selection_mode not in {"age_cutoff", "large_video"}:
+            raise ValueError(f"unknown iCloud selection mode: {selection_mode}")
+        if selection_mode == "large_video" and selection_threshold_bytes is None:
+            raise ValueError("large-video archive requires a frozen size threshold")
+        if selection_mode == "age_cutoff" and selection_threshold_bytes is not None:
+            raise ValueError("age-cutoff archive cannot have a video size threshold")
         self.database.get_profile(profile_id)
         ExternalDriveClient(self.config.external_drive).assert_ready()
         scan = self.unarchived_scan(profile_id, scan)
@@ -149,6 +383,8 @@ class ICloudWorkflow:
             summary.job_id,
             library_id,
             summary.cutoff_at_utc,
+            selection_mode=selection_mode,
+            selection_threshold_bytes=selection_threshold_bytes,
         )
         self._progress(
             "ICLOUD_ARCHIVE_STARTED",
@@ -198,11 +434,328 @@ class ICloudWorkflow:
             warnings=scan.warnings,
         )
 
+    def build_pipeline_scope(
+        self,
+        profile_id: str,
+        scan: PhotoLibraryScan,
+        *,
+        selection_mode: str = "age_cutoff",
+        selection_threshold_bytes: int | None = None,
+    ) -> ICloudPipelineScope:
+        """Freeze all work authorized by one interactive sync-all confirmation."""
+        if selection_mode not in {"age_cutoff", "large_video"}:
+            raise ValueError(f"unknown iCloud selection mode: {selection_mode}")
+        if selection_mode == "large_video" and selection_threshold_bytes is None:
+            raise ValueError("large-video pipeline requires a frozen size threshold")
+        if selection_mode == "age_cutoff" and selection_threshold_bytes is not None:
+            raise ValueError("age-cutoff pipeline cannot have a video size threshold")
+
+        batch_size = self.config.icloud_cleanup.batch_size
+        cleanup_chunks: list[ICloudPipelineCleanupChunk] = []
+        resume_batches: list[ICloudPipelineResumeBatch] = []
+        claimed: set[str] = set()
+        historical_thresholds: set[int] = set()
+        historical_policies: list[dict[str, Any]] = []
+
+        for batch in self.database.list_icloud_pipeline_batches(
+            profile_id, selection_mode
+        ):
+            batch_id = str(batch["batch_id"])
+            rows = [
+                row
+                for row in self.database.list_icloud_batch_assets(batch_id)
+                if row["cleanup_state"] != "DELETED"
+            ]
+            if not rows:
+                continue
+            incomplete = [
+                row
+                for row in rows
+                if row["state"] != "SAFE_TO_DELETE" or bool(row["review_required"])
+            ]
+            can_resume = (
+                bool(incomplete)
+                and len(rows) <= batch_size
+                and batch["state"] in {"ARCHIVING", "NEEDS_ATTENTION"}
+            )
+            threshold = batch["selection_threshold_bytes"]
+
+            if can_resume:
+                identifiers = tuple(str(row["photos_local_id"]) for row in rows)
+                overlap = claimed.intersection(identifiers)
+                if overlap:
+                    raise PhoneSafetyError(
+                        "the same iCloud asset appears in multiple pending pipeline batches"
+                    )
+                claimed.update(identifiers)
+                resume_batches.append(
+                    ICloudPipelineResumeBatch(
+                        batch_id=batch_id,
+                        local_identifiers=identifiers,
+                        incomplete_assets=len(incomplete),
+                    )
+                )
+                historical_policies.append(
+                    {
+                        "batch_id": batch_id,
+                        "cutoff_at_utc": str(batch["cutoff_at_utc"]),
+                        "selection_threshold_bytes": threshold,
+                    }
+                )
+                if threshold is not None:
+                    historical_thresholds.add(int(threshold))
+                continue
+
+            ready = [
+                row
+                for row in rows
+                if row["state"] == "SAFE_TO_DELETE" and not bool(row["review_required"])
+            ]
+            identifiers = tuple(str(row["photos_local_id"]) for row in ready)
+            overlap = claimed.intersection(identifiers)
+            if overlap:
+                raise PhoneSafetyError(
+                    "the same iCloud asset appears in multiple pending cleanup batches"
+                )
+            claimed.update(identifiers)
+            cleanup_chunks.extend(
+                ICloudPipelineCleanupChunk(batch_id, tuple(group))
+                for group in batched(identifiers, batch_size)
+            )
+            if identifiers:
+                historical_policies.append(
+                    {
+                        "batch_id": batch_id,
+                        "cutoff_at_utc": str(batch["cutoff_at_utc"]),
+                        "selection_threshold_bytes": threshold,
+                    }
+                )
+                if threshold is not None:
+                    historical_thresholds.add(int(threshold))
+
+        archived = self.database.verified_icloud_local_ids(profile_id)
+        fresh_assets = tuple(
+            sorted(
+                (
+                    asset
+                    for asset in scan.assets
+                    if asset.local_identifier not in archived
+                    and asset.local_identifier not in claimed
+                ),
+                key=lambda asset: (asset.creation_at_utc, asset.local_identifier),
+            )
+        )
+        new_scan = PhotoLibraryScan(
+            authorization=scan.authorization,
+            assets=fresh_assets,
+            total_assets=scan.total_assets,
+            total_resources=scan.total_resources,
+            warnings=scan.warnings,
+        )
+        authorization_payload = {
+            "version": 1,
+            "profile_id": profile_id,
+            "selection_mode": selection_mode,
+            "cutoff_at_utc": self._cutoff(),
+            "selection_threshold_bytes": selection_threshold_bytes,
+            "batch_size": batch_size,
+            "cleanup_chunks": [
+                {
+                    "batch_id": chunk.batch_id,
+                    "local_identifiers": list(chunk.local_identifiers),
+                }
+                for chunk in cleanup_chunks
+            ],
+            "resume_batches": [
+                {
+                    "batch_id": batch.batch_id,
+                    "local_identifiers": list(batch.local_identifiers),
+                }
+                for batch in resume_batches
+            ],
+            "new_local_identifiers": [
+                asset.local_identifier for asset in fresh_assets
+            ],
+            "historical_policies": historical_policies,
+        }
+        authorization_sha256 = hashlib.sha256(
+            json.dumps(
+                authorization_payload, separators=(",", ":"), sort_keys=True
+            ).encode()
+        ).hexdigest()
+        return ICloudPipelineScope(
+            profile_id=profile_id,
+            selection_mode=selection_mode,
+            cutoff_at_utc=self._cutoff(),
+            selection_threshold_bytes=selection_threshold_bytes,
+            batch_size=batch_size,
+            cleanup_chunks=tuple(cleanup_chunks),
+            resume_batches=tuple(resume_batches),
+            new_scan=new_scan,
+            authorization_sha256=authorization_sha256,
+            historical_thresholds=tuple(sorted(historical_thresholds)),
+        )
+
+    def execute_pipeline(
+        self,
+        scope: ICloudPipelineScope,
+        session: PhotoLibrarySession,
+        *,
+        batch_completed: Callable[[str], None] | None = None,
+    ) -> ICloudPipelineResult:
+        """Execute a previously frozen, interactively authorized pipeline scope."""
+        authorized = {
+            identifier
+            for chunk in scope.cleanup_chunks
+            for identifier in chunk.local_identifiers
+        }
+        authorized.update(
+            identifier
+            for batch in scope.resume_batches
+            for identifier in batch.local_identifiers
+        )
+        authorized.update(asset.local_identifier for asset in scope.new_scan.assets)
+        if len(authorized) != scope.authorized_assets:
+            raise PhoneSafetyError("the frozen iCloud pipeline scope contains duplicates")
+
+        batch_ids: list[str] = []
+        completed_chunks = 0
+        archived_assets = 0
+        deleted = 0
+
+        def record_batch(batch_id: str) -> None:
+            nonlocal completed_chunks
+            completed_chunks += 1
+            if batch_id not in batch_ids:
+                batch_ids.append(batch_id)
+            if batch_completed is not None:
+                batch_completed(batch_id)
+
+        for chunk in scope.cleanup_chunks:
+            result = self._execute_pipeline_cleanup(
+                chunk.batch_id,
+                frozenset(chunk.local_identifiers),
+                authorized,
+                session,
+            )
+            deleted += result["deleted"]
+            if result["failed"]:
+                raise PhoneSafetyError(
+                    f"iCloud pipeline stopped after cleanup failure in {chunk.batch_id}"
+                )
+            record_batch(chunk.batch_id)
+
+        for pending in scope.resume_batches:
+            self.resume_archive(pending.batch_id, session)
+            rows_by_identifier = {
+                str(row["photos_local_id"]): row
+                for row in self.database.list_icloud_batch_assets(pending.batch_id)
+            }
+            if any(
+                identifier not in rows_by_identifier
+                or rows_by_identifier[identifier]["state"] != "SAFE_TO_DELETE"
+                or bool(rows_by_identifier[identifier]["review_required"])
+                for identifier in pending.local_identifiers
+            ):
+                raise PhoneSafetyError(
+                    f"iCloud pipeline stopped because {pending.batch_id} is not fully verified"
+                )
+            archived_assets += pending.incomplete_assets
+            result = self._execute_pipeline_cleanup(
+                pending.batch_id,
+                frozenset(pending.local_identifiers),
+                authorized,
+                session,
+            )
+            deleted += result["deleted"]
+            if result["failed"]:
+                raise PhoneSafetyError(
+                    f"iCloud pipeline stopped after cleanup failure in {pending.batch_id}"
+                )
+            record_batch(pending.batch_id)
+
+        for group in batched(scope.new_scan.assets, scope.batch_size):
+            assets = tuple(group)
+            subset = PhotoLibraryScan(
+                authorization=scope.new_scan.authorization,
+                assets=assets,
+                total_assets=scope.new_scan.total_assets,
+                total_resources=scope.new_scan.total_resources,
+                warnings=scope.new_scan.warnings,
+            )
+            archived = self.archive_scan(
+                scope.profile_id,
+                session,
+                subset,
+                candidate_limit=len(assets),
+                selection_mode=scope.selection_mode,
+                selection_threshold_bytes=scope.selection_threshold_bytes,
+            )
+            if archived.counts.get("SAFE_TO_DELETE", 0) != len(assets):
+                raise PhoneSafetyError(
+                    f"iCloud pipeline stopped because {archived.batch_id} is not fully verified"
+                )
+            archived_assets += len(assets)
+            expected = frozenset(asset.local_identifier for asset in assets)
+            result = self._execute_pipeline_cleanup(
+                archived.batch_id,
+                expected,
+                authorized,
+                session,
+            )
+            deleted += result["deleted"]
+            if result["failed"]:
+                raise PhoneSafetyError(
+                    f"iCloud pipeline stopped after cleanup failure in {archived.batch_id}"
+                )
+            record_batch(archived.batch_id)
+
+        return ICloudPipelineResult(
+            batch_ids=tuple(batch_ids),
+            completed_chunks=completed_chunks,
+            archived_assets=archived_assets,
+            deleted=deleted,
+            failed=0,
+        )
+
+    def _execute_pipeline_cleanup(
+        self,
+        batch_id: str,
+        expected: frozenset[str],
+        authorized: set[str],
+        session: PhotoLibrarySession,
+    ) -> dict[str, int]:
+        if not expected or not expected.issubset(authorized):
+            raise PhoneSafetyError("iCloud cleanup escaped the frozen pipeline scope")
+        batch = self.database.get_icloud_batch(batch_id)
+        if batch["state"] == "CLEANING_ICLOUD":
+            self._reconcile_delete_intents(batch_id, session)
+            expected = frozenset(
+                str(row["photos_local_id"])
+                for row in self.database.list_icloud_batch_assets(batch_id)
+                if row["cleanup_state"] != "DELETED"
+                and str(row["photos_local_id"]) in expected
+            )
+            if not expected:
+                return {"deleted": 0, "failed": 0}
+        plan = self.prepare_cleanup(
+            batch_id,
+            session,
+            local_identifiers=expected,
+        )
+        planned = {asset.local_identifier for asset in plan.assets}
+        if planned != expected or not planned.issubset(authorized):
+            raise PhoneSafetyError("iCloud deletion plan changed outside the authorized scope")
+        return self.execute_cleanup(plan, session)
+
     def archive_all_batches(
         self,
         profile_id: str,
         session: PhotoLibrarySession,
         scan: PhotoLibraryScan,
+        *,
+        selection_mode: str = "age_cutoff",
+        selection_threshold_bytes: int | None = None,
     ) -> tuple[ArchivedICloudBatch, ...]:
         remaining = self.unarchived_scan(profile_id, scan)
         completed: list[ArchivedICloudBatch] = []
@@ -219,6 +772,8 @@ class ICloudWorkflow:
                 session,
                 subset,
                 candidate_limit=len(subset.assets),
+                selection_mode=selection_mode,
+                selection_threshold_bytes=selection_threshold_bytes,
             )
             completed.append(archived)
             if archived.counts.get("SAFE_TO_DELETE", 0) != len(subset.assets):
@@ -237,13 +792,19 @@ class ICloudWorkflow:
             library_id=str(batch["library_id"]),
         )
         self.database.set_icloud_batch_state(batch_id, "ARCHIVING")
-        counts = ArchiveRunner(
-            self.config,
-            self.database,
-            source,
-            ExternalDriveClient(self.config.external_drive),
-            progress=self.progress,
-        ).run_job(str(batch["job_id"]), resume=True)
+        try:
+            counts = ArchiveRunner(
+                self.config,
+                self.database,
+                source,
+                ExternalDriveClient(self.config.external_drive),
+                progress=self.progress,
+            ).run_job(str(batch["job_id"]), resume=True)
+        except BaseException:
+            self.database.set_icloud_batch_state(
+                batch_id, "NEEDS_ATTENTION", error_code="ARCHIVE_INTERRUPTED"
+            )
+            raise
         self._mark_ready_assets(batch_id)
         ready = any(
             row["cleanup_state"] == "READY"
@@ -316,7 +877,17 @@ class ICloudWorkflow:
                 )
         if not candidates:
             raise PhoneSafetyError("no fully verified iCloud assets remain eligible for deletion")
-        validation = session.revalidate(candidates, cutoff_at_utc=str(batch["cutoff_at_utc"]))
+        selection_mode = str(batch["selection_mode"])
+        if selection_mode == "large_video":
+            validation = session.revalidate(
+                candidates,
+                cutoff_at_utc=str(batch["cutoff_at_utc"]),
+                selection_mode=selection_mode,
+            )
+        else:
+            validation = session.revalidate(
+                candidates, cutoff_at_utc=str(batch["cutoff_at_utc"])
+            )
         valid_ids = set(validation.valid_local_identifiers)
         missing_ids = set(validation.missing_local_identifiers)
         mismatched_ids = set(validation.mismatched_local_identifiers)
@@ -408,6 +979,11 @@ class ICloudWorkflow:
             batch_id=plan.batch_id,
             cutoff_at_utc=plan.cutoff_at_utc,
             plan_sha256=plan.plan_sha256,
+            **(
+                {"selection_mode": plan.selection_mode}
+                if plan.selection_mode == "large_video"
+                else {}
+            ),
         )
         deleted = set(result.deleted_local_identifiers)
         reported_failed = set(result.failed_local_identifiers)
@@ -450,6 +1026,13 @@ class ICloudWorkflow:
                 and required > 0
                 and required == archived
             )
+            if row["selection_mode"] == "large_video":
+                ready = (
+                    ready
+                    and row["media_type"] == "video"
+                    and row["selection_threshold_bytes"] is not None
+                    and int(row["qualifying_original_video_count"] or 0) > 0
+                )
             self.database.set_icloud_asset_state(
                 str(row["batch_asset_id"]),
                 "READY" if ready else "REMAINING",
@@ -533,7 +1116,7 @@ class ICloudWorkflow:
                         ],
                     }
                 )
-        return {
+        base = {
             "schema_version": 1,
             "batch_id": str(batch["batch_id"]),
             "profile_id": str(batch["profile_id"]),
@@ -541,6 +1124,35 @@ class ICloudWorkflow:
             "cutoff_at_utc": str(batch["cutoff_at_utc"]),
             "assets": planned_assets,
         }
+        if batch["selection_mode"] == "large_video":
+            threshold = batch["selection_threshold_bytes"]
+            if threshold is None:
+                raise PhoneSafetyError("large-video batch is missing its size threshold")
+            ordered_assets = sorted(assets, key=lambda item: item.local_identifier)
+            for planned, asset in zip(planned_assets, ordered_assets, strict=True):
+                qualifying_keys = sorted(
+                    resource.resource_key
+                    for resource in asset.resources
+                    if resource.resource_type_code == 2
+                    and any(
+                        evidence["resource_key"] == resource.resource_key
+                        and int(evidence["size"]) > int(threshold)
+                        for evidence in planned["resources"]
+                    )
+                )
+                if not qualifying_keys:
+                    raise PhoneSafetyError(
+                        "large-video deletion lacks a verified original above the threshold"
+                    )
+                planned["qualifying_original_video_resource_keys"] = qualifying_keys
+            base.update(
+                {
+                    "schema_version": 2,
+                    "selection_mode": "large_video",
+                    "selection_threshold_bytes": int(threshold),
+                }
+            )
+        return base
 
     def _cleanup_plan(
         self, batch: Any, assets: tuple[PhotoLibraryAsset, ...]
@@ -561,6 +1173,12 @@ class ICloudWorkflow:
             plan_sha256=digest,
             assets=assets,
             total_bytes=total_bytes,
+            selection_mode=str(batch["selection_mode"]),
+            selection_threshold_bytes=(
+                int(batch["selection_threshold_bytes"])
+                if batch["selection_threshold_bytes"] is not None
+                else None
+            ),
         )
 
     def _reconcile_delete_intents(
@@ -570,7 +1188,16 @@ class ICloudWorkflow:
         intents = self._asset_references(batch_id, {"DELETE_INTENT"})
         if not intents:
             return
-        validation = session.revalidate(intents, cutoff_at_utc=str(batch["cutoff_at_utc"]))
+        if batch["selection_mode"] == "large_video":
+            validation = session.revalidate(
+                intents,
+                cutoff_at_utc=str(batch["cutoff_at_utc"]),
+                selection_mode="large_video",
+            )
+        else:
+            validation = session.revalidate(
+                intents, cutoff_at_utc=str(batch["cutoff_at_utc"])
+            )
         valid = set(validation.valid_local_identifiers)
         missing = set(validation.missing_local_identifiers)
         rows = {

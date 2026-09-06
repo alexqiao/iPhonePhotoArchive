@@ -58,6 +58,8 @@ ICLOUD_CSV_FIELDS = [
     "asset_key",
     "profile_id",
     "batch_id",
+    "selection_mode",
+    "selection_threshold_bytes",
     "creation_at_utc",
     "media_type",
     "cleanup_state",
@@ -300,6 +302,10 @@ def generate_report(database: Database, job_id: str, output: Path) -> tuple[Path
                     "asset_key": str(row["id"])[:8],
                     "profile_id": icloud_batch["profile_id"],
                     "batch_id": icloud_batch["batch_id"],
+                    "selection_mode": icloud_batch["selection_mode"],
+                    "selection_threshold_bytes": (
+                        icloud_batch["selection_threshold_bytes"] or ""
+                    ),
                     "creation_at_utc": row["creation_at_utc"],
                     "media_type": row["media_type"],
                     "cleanup_state": row["cleanup_state"],
@@ -397,6 +403,10 @@ def generate_report(database: Database, job_id: str, output: Path) -> tuple[Path
                 "icloud_cleanup": {
                     "state": icloud_batch["state"],
                     "cutoff_at_utc": icloud_batch["cutoff_at_utc"],
+                    "selection_mode": icloud_batch["selection_mode"],
+                    "selection_threshold_bytes": icloud_batch[
+                        "selection_threshold_bytes"
+                    ],
                     "plan_sha256": icloud_batch["deletion_plan_sha256"],
                     "counts": dict(sorted(cleanup_counts.items())),
                     "assets": icloud_rows,

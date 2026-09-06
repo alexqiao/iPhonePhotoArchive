@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import yaml
@@ -8,7 +9,10 @@ from typer.testing import CliRunner
 
 import photoarchive.cli as cli_module
 from photoarchive.cli import app
+from photoarchive.config import AppConfig
+from photoarchive.domain import PhotoLibraryAsset, PhotoLibraryScan
 from photoarchive.external_drive import ExternalDriveClient
+from photoarchive.icloud_workflow import ICloudPipelineResult, ICloudPipelineScope
 
 
 def test_phone_progress_is_written_to_stderr(capsys) -> None:
@@ -125,6 +129,100 @@ def test_cli_registers_and_runs_dry_plan(tmp_path: Path, demo_fixture: Path) -> 
     assert result.exit_code == 0, result.output
     assert '"candidate_assets": 6' in result.output
     assert not (tmp_path / "db.sqlite3").exists()
+
+
+def test_sync_all_cli_confirms_the_frozen_scope_once(
+    app_config: AppConfig, monkeypatch
+) -> None:
+    config = app_config.model_copy(
+        update={
+            "icloud_cleanup": app_config.icloud_cleanup.model_copy(update={"enabled": True})
+        }
+    )
+    asset = PhotoLibraryAsset(
+        "asset-local-id",
+        datetime(2020, 1, 1, tzinfo=UTC),
+        "image",
+        (),
+    )
+    scan = PhotoLibraryScan("authorized", (asset,), 1, 0)
+    scope = ICloudPipelineScope(
+        profile_id="wife",
+        selection_mode="age_cutoff",
+        cutoff_at_utc="2024-01-01T00:00:00Z",
+        selection_threshold_bytes=None,
+        batch_size=1000,
+        cleanup_chunks=(),
+        resume_batches=(),
+        new_scan=scan,
+        authorization_sha256="a" * 64,
+    )
+    calls = {"confirm": 0, "execute": 0}
+
+    class DummyDrive:
+        def assert_ready(self) -> None:
+            return None
+
+    class DummyDatabase:
+        def migrate(self) -> None:
+            return None
+
+    class DummySession:
+        def close(self) -> None:
+            return None
+
+    class DummyClient:
+        def open_session(self) -> DummySession:
+            return DummySession()
+
+    class DummyWorkflow:
+        client = DummyClient()
+
+        def scan(self, profile, session):
+            del profile, session
+            return scan, object()
+
+        def build_pipeline_scope(self, profile, selected, **kwargs):
+            del profile, selected, kwargs
+            return scope
+
+        def execute_pipeline(self, selected_scope, session, *, batch_completed):
+            del selected_scope, session, batch_completed
+            calls["execute"] += 1
+            return ICloudPipelineResult((), 0, 1, 1, 0)
+
+    def confirm_once(prompt: str) -> bool:
+        assert "Authorization SHA-256" in prompt
+        calls["confirm"] += 1
+        return True
+
+    monkeypatch.setattr(cli_module, "_config", lambda _ctx: config)
+    monkeypatch.setattr(cli_module, "_database", lambda _config: DummyDatabase())
+    monkeypatch.setattr(cli_module, "ExternalDriveClient", lambda _config: DummyDrive())
+    monkeypatch.setattr(
+        cli_module, "_icloud_workflow", lambda _config, _database: DummyWorkflow()
+    )
+    monkeypatch.setattr(cli_module.typer, "confirm", confirm_once)
+
+    result = CliRunner().invoke(
+        app,
+        ["icloud", "sync-all", "--profile", "wife"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == {"confirm": 1, "execute": 1}
+    payload = json.loads(result.output)
+    assert payload["status"] == "completed"
+    assert payload["authorization_sha256"] == "a" * 64
+
+    monkeypatch.setattr(cli_module.typer, "confirm", lambda _prompt: False)
+    cancelled = CliRunner().invoke(
+        app,
+        ["icloud", "sync-all", "--profile", "wife"],
+    )
+    assert cancelled.exit_code == 0, cancelled.output
+    assert calls["execute"] == 1
+    assert json.loads(cancelled.output)["status"] == "cancelled"
 
 
 def folder_config(tmp_path: Path) -> Path:

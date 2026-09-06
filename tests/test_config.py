@@ -78,3 +78,17 @@ def test_icloud_batch_size_does_not_change_archive_evidence_fingerprint(
         }
     )
     assert changed.fingerprint() == app_config.fingerprint()
+
+
+def test_large_video_threshold_is_100_mib_and_is_frozen_outside_job_fingerprint(
+    app_config: AppConfig,
+) -> None:
+    assert app_config.archive_policy.large_video_threshold_bytes == 100 * 1024 * 1024
+    changed = app_config.model_copy(
+        update={
+            "archive_policy": app_config.archive_policy.model_copy(
+                update={"large_video_threshold_bytes": 200 * 1024 * 1024}
+            )
+        }
+    )
+    assert changed.fingerprint() == app_config.fingerprint()

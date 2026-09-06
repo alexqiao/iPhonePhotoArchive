@@ -26,7 +26,11 @@ from photoarchive.external_drive import ExternalDriveClient
 from photoarchive.fake_archive import FakeArchiveTarget
 from photoarchive.fixture import FixturePhotosClient
 from photoarchive.icloud_client import SwiftPhotoLibraryClient
-from photoarchive.icloud_workflow import ICloudCleanupPlan, ICloudWorkflow
+from photoarchive.icloud_workflow import (
+    ICloudCleanupPlan,
+    ICloudPipelineScope,
+    ICloudWorkflow,
+)
 from photoarchive.locking import FileLock, LockUnavailableError
 from photoarchive.paths import safe_path
 from photoarchive.phone_client import SwiftPhoneClient
@@ -42,12 +46,14 @@ batch_app = typer.Typer(help="Prepare and archive one Image Capture import.")
 device_app = typer.Typer(help="Bind one physical iPhone to a person profile.")
 phone_app = typer.Typer(help="Import, verify, and safely clean an iPhone.")
 icloud_app = typer.Typer(help="Archive, verify, and safely clean the system iCloud Photos library.")
+large_video_app = typer.Typer(help="Find and archive any-date iCloud Photos videos over 100 MiB.")
 app.add_typer(db_app, name="db")
 app.add_typer(profile_app, name="profile")
 app.add_typer(batch_app, name="batch")
 app.add_typer(device_app, name="device")
 app.add_typer(phone_app, name="phone")
 app.add_typer(icloud_app, name="icloud")
+icloud_app.add_typer(large_video_app, name="large-video")
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +245,25 @@ def _icloud_progress(event: str, details: dict[str, Any]) -> None:
             f"符合截止时间 {details.get('assets', 0)} 项 "
             f"({details.get('resources', 0)} 个资源); 容量需下载原件后确定"
         ),
+        "ICLOUD_LARGE_VIDEO_SCAN_STARTED": "正在读取照片图库中的视频元数据",
+        "ICLOUD_LARGE_VIDEO_SCAN_COMPLETED": (
+            f"大视频扫描完成: 视频 {details.get('videos', 0)} 项; "
+            f"已确认超过阈值 {details.get('large', 0)} 项; "
+            f"待测量 {details.get('pending', 0)} 项"
+        ),
+        "ICLOUD_LARGE_VIDEO_MEASURE_STARTED": (
+            f"[测量 {details.get('current', 0)}/{details.get('total', 0)}] "
+            f"正在读取原始视频数据"
+        ),
+        "ICLOUD_LARGE_VIDEO_MEASURE_COMPLETED": (
+            f"[测量 {details.get('current', 0)}/{details.get('total', 0)}] 完成: "
+            + (
+                "超过阈值"
+                if details.get("exceeds_threshold")
+                else f"{_human_bytes(int(details.get('observed_bytes', 0)))}"
+            )
+        ),
+        "ICLOUD_LARGE_VIDEO_UNMEASURABLE": "跳过缺少原始视频资源的资产",
         "ICLOUD_ARCHIVE_STARTED": (
             f"开始下载并归档 {details.get('assets', 0)} 项 "
             f"({details.get('resources', 0)} 个资源)"
@@ -312,9 +337,15 @@ def _cleanup_prompt(plan: CleanupPlan) -> str:
 
 
 def _icloud_cleanup_prompt(plan: ICloudCleanupPlan) -> str:
+    selection = (
+        f"with an original video larger than {plan.selection_threshold_bytes} bytes, regardless "
+        "of creation date,"
+        if plan.selection_mode == "large_video"
+        else f"older than {plan.cutoff_at_utc}"
+    )
     return (
         f"Delete {len(plan.assets)} verified assets ({plan.total_bytes} archived bytes) "
-        f"older than {plan.cutoff_at_utc} from the ENTIRE iCloud Photos library? "
+        f"{selection} from the ENTIRE iCloud Photos library? "
         "This affects every device using this Apple Account. Items move to Recently Deleted; "
         "permanently delete them there manually if you need the iCloud space immediately."
     )
@@ -326,10 +357,39 @@ def _icloud_group_cleanup_prompt(
     assets = sum(len(plan.assets) for plan in plans)
     total_bytes = sum(plan.total_bytes for plan in plans)
     batches = len({plan.batch_id for plan in plans})
+    large_video_assets = sum(
+        len(plan.assets) for plan in plans if plan.selection_mode == "large_video"
+    )
+    selection_note = (
+        f" This includes {large_video_assets} any-date large-video assets."
+        if large_video_assets
+        else ""
+    )
     return (
         f"Delete {assets} verified assets ({total_bytes} archived bytes) from "
         f"{batches} archive batches in {len(plans)} chunks? "
-        f"Aggregate plan SHA-256: {aggregate_sha256}. "
+        f"Aggregate plan SHA-256: {aggregate_sha256}.{selection_note} "
+        "This affects every device using this Apple Account. Items move to Recently Deleted."
+    )
+
+
+def _icloud_pipeline_prompt(scope: ICloudPipelineScope) -> str:
+    policy = (
+        f"new videos strictly larger than {scope.selection_threshold_bytes} bytes"
+        if scope.selection_mode == "large_video"
+        else f"new assets older than {scope.cutoff_at_utc}"
+    )
+    historical = (
+        f" Historical large-video thresholds: {', '.join(map(str, scope.historical_thresholds))}."
+        if scope.historical_thresholds
+        else ""
+    )
+    return (
+        f"Authorize this entire sync-all run for {scope.authorized_assets} frozen iCloud Photos "
+        f"assets ({scope.ready_assets} already verified, {scope.resume_assets} in resumable "
+        f"batches, {scope.new_assets} new; batch size {scope.batch_size}; {policy})? "
+        f"Authorization SHA-256: {scope.authorization_sha256}.{historical} "
+        "Each batch will be archived, fully revalidated, and deleted before the next batch. "
         "This affects every device using this Apple Account. Items move to Recently Deleted."
     )
 
@@ -721,6 +781,120 @@ def icloud_scan(
         _fail(exc)
 
 
+def _run_icloud_sync_all(
+    ctx: typer.Context,
+    profile: str,
+    *,
+    selection_mode: str,
+) -> None:
+    config = _config(ctx)
+    if not config.icloud_cleanup.enabled:
+        raise PhoneSafetyError("iCloud cleanup is disabled in configuration")
+    ExternalDriveClient(config.external_drive).assert_ready()
+    database = _database(config)
+    database.migrate()
+    workflow = _icloud_workflow(config, database)
+    session = workflow.client.open_session()
+    try:
+        with FileLock(_lock_path(config)):
+            if selection_mode == "large_video":
+                scan, large_video_summary = workflow.scan_large_videos(profile, session)
+                selected = workflow.select_large_videos(profile, session, scan)
+                threshold = large_video_summary.threshold_bytes
+            else:
+                selected, _ = workflow.scan(profile, session)
+                threshold = None
+            scope = workflow.build_pipeline_scope(
+                profile,
+                selected,
+                selection_mode=selection_mode,
+                selection_threshold_bytes=threshold,
+            )
+            if not scope.authorized_assets:
+                _echo(
+                    {
+                        "authorization_sha256": scope.authorization_sha256,
+                        "candidate_assets": 0,
+                        "profile_id": profile,
+                        "selection_mode": selection_mode,
+                        "status": "no_pipeline_candidates",
+                    }
+                )
+                return
+            if not typer.confirm(_icloud_pipeline_prompt(scope)):
+                _echo(
+                    {
+                        "authorization_sha256": scope.authorization_sha256,
+                        "authorized_assets": scope.authorized_assets,
+                        "profile_id": profile,
+                        "selection_mode": selection_mode,
+                        "status": "cancelled",
+                    }
+                )
+                return
+
+            reports: dict[str, dict[str, str]] = {}
+
+            def write_batch_report(batch_id: str) -> None:
+                batch = workflow.database.get_icloud_batch(batch_id)
+                report = _icloud_report(
+                    workflow,
+                    batch_id,
+                    {
+                        "authorization_sha256": scope.authorization_sha256,
+                        "batch_id": batch_id,
+                        "selection_mode": str(batch["selection_mode"]),
+                        "status": str(batch["state"]).lower(),
+                    },
+                )
+                reports[batch_id] = {
+                    "batch_id": batch_id,
+                    "report_csv": str(report["report_csv"]),
+                    "report_json": str(report["report_json"]),
+                }
+
+            result = workflow.execute_pipeline(
+                scope,
+                session,
+                batch_completed=write_batch_report,
+            )
+        _echo(
+            {
+                "archived_assets": result.archived_assets,
+                "authorization_sha256": scope.authorization_sha256,
+                "authorized_assets": scope.authorized_assets,
+                "batch_ids": list(result.batch_ids),
+                "batch_size": scope.batch_size,
+                "completed_chunks": result.completed_chunks,
+                "deleted": result.deleted,
+                "failed": result.failed,
+                "profile_id": profile,
+                "ready_assets": scope.ready_assets,
+                "recently_deleted_action_required": result.deleted > 0,
+                "reports": list(reports.values()),
+                "resume_assets": scope.resume_assets,
+                "selection_mode": selection_mode,
+                "status": "completed",
+            }
+        )
+    finally:
+        session.close()
+
+
+@icloud_app.command("sync-all")
+def icloud_sync_all(
+    ctx: typer.Context,
+    profile: Annotated[str, typer.Option("--profile")],
+) -> None:
+    """Confirm once, then archive, verify, and delete every bounded old-photo batch."""
+    try:
+        _run_icloud_sync_all(ctx, profile, selection_mode="age_cutoff")
+    except typer.Abort:
+        raise
+    except (KeyError, OSError, RuntimeError, ValidationError, ValueError, PhotoArchiveError) as exc:
+        _fail(exc)
+
+
 @icloud_app.command("sync")
 def icloud_sync(
     ctx: typer.Context,
@@ -835,6 +1009,189 @@ def icloud_archive_night(
         _fail(exc)
 
 
+@large_video_app.command("scan")
+def icloud_large_video_scan(
+    ctx: typer.Context,
+    profile: Annotated[str, typer.Option("--profile")],
+) -> None:
+    """List video metadata and cached size classifications without downloading originals."""
+    try:
+        config = _config(ctx)
+        database = _database(config)
+        database.migrate()
+        workflow = _icloud_workflow(config, database)
+        with FileLock(_lock_path(config)):
+            _, summary = workflow.scan_large_videos(profile)
+        payload = asdict(summary)
+        payload.update(
+            {
+                "profile_id": profile,
+                "scope": "system_photos_library_any_date_original_videos",
+                "measurement_performed": False,
+            }
+        )
+        _echo(payload)
+    except (KeyError, OSError, RuntimeError, ValidationError, ValueError, PhotoArchiveError) as exc:
+        _fail(exc)
+
+
+@large_video_app.command("sync")
+def icloud_large_video_sync(
+    ctx: typer.Context,
+    profile: Annotated[str, typer.Option("--profile")],
+) -> None:
+    """Measure and archive one batch of any-date large videos, then confirm deletion."""
+    try:
+        config = _config(ctx)
+        if not config.icloud_cleanup.enabled:
+            raise PhoneSafetyError("iCloud cleanup is disabled in configuration")
+        ExternalDriveClient(config.external_drive).assert_ready()
+        database = _database(config)
+        database.migrate()
+        workflow = _icloud_workflow(config, database)
+        session = workflow.client.open_session()
+        try:
+            with FileLock(_lock_path(config)):
+                scan, summary = workflow.scan_large_videos(profile, session)
+                selected = workflow.select_large_videos(
+                    profile,
+                    session,
+                    scan,
+                    limit=config.icloud_cleanup.batch_size,
+                )
+                if not selected.assets:
+                    _echo(
+                        {
+                            "candidate_assets": 0,
+                            "profile_id": profile,
+                            "status": "no_unarchived_large_videos",
+                            "threshold_bytes": summary.threshold_bytes,
+                        }
+                    )
+                    return
+                archived = workflow.archive_scan(
+                    profile,
+                    session,
+                    selected,
+                    candidate_limit=len(selected.assets),
+                    selection_mode="large_video",
+                    selection_threshold_bytes=summary.threshold_bytes,
+                )
+                plan = workflow.prepare_cleanup(archived.batch_id, session)
+                if not typer.confirm(_icloud_cleanup_prompt(plan)):
+                    _echo(
+                        _icloud_report(
+                            workflow,
+                            archived.batch_id,
+                            {
+                                "batch_id": archived.batch_id,
+                                "job_id": archived.job_id,
+                                "plan_sha256": plan.plan_sha256,
+                                "selection_mode": plan.selection_mode,
+                                "status": "ready_for_icloud_cleanup",
+                                "threshold_bytes": plan.selection_threshold_bytes,
+                            },
+                        )
+                    )
+                    return
+                result = workflow.execute_cleanup(plan, session)
+                payload = _icloud_report(
+                    workflow,
+                    archived.batch_id,
+                    {
+                        "batch_id": archived.batch_id,
+                        "job_id": archived.job_id,
+                        "candidate_assets": len(selected.assets),
+                        "archived_bytes": plan.total_bytes,
+                        "plan_sha256": plan.plan_sha256,
+                        "selection_mode": plan.selection_mode,
+                        "threshold_bytes": plan.selection_threshold_bytes,
+                        "recently_deleted_action_required": result["deleted"] > 0,
+                        "status": (
+                            "completed"
+                            if result["failed"] == 0
+                            else "completed_with_items_remaining"
+                        ),
+                        **result,
+                    },
+                )
+            _echo(payload)
+        finally:
+            session.close()
+    except typer.Abort:
+        raise
+    except (KeyError, OSError, RuntimeError, ValidationError, ValueError, PhotoArchiveError) as exc:
+        _fail(exc)
+
+
+@large_video_app.command("sync-all")
+def icloud_large_video_sync_all(
+    ctx: typer.Context,
+    profile: Annotated[str, typer.Option("--profile")],
+) -> None:
+    """Confirm once, then archive, verify, and delete every bounded large-video batch."""
+    try:
+        _run_icloud_sync_all(ctx, profile, selection_mode="large_video")
+    except typer.Abort:
+        raise
+    except (KeyError, OSError, RuntimeError, ValidationError, ValueError, PhotoArchiveError) as exc:
+        _fail(exc)
+
+
+@large_video_app.command("archive-night")
+def icloud_large_video_archive_night(
+    ctx: typer.Context,
+    profile: Annotated[str, typer.Option("--profile")],
+) -> None:
+    """Measure and archive all any-date large videos without deleting Photos assets."""
+    try:
+        config = _config(ctx)
+        if not config.icloud_cleanup.enabled:
+            raise PhoneSafetyError("iCloud cleanup is disabled in configuration")
+        ExternalDriveClient(config.external_drive).assert_ready()
+        database = _database(config)
+        database.migrate()
+        workflow = _icloud_workflow(config, database)
+        session = workflow.client.open_session()
+        try:
+            with FileLock(_lock_path(config)):
+                scan, summary = workflow.scan_large_videos(profile, session)
+                selected = workflow.select_large_videos(profile, session, scan)
+                if not selected.assets:
+                    _echo(
+                        {
+                            "candidate_assets": 0,
+                            "profile_id": profile,
+                            "status": "no_unarchived_large_videos",
+                            "threshold_bytes": summary.threshold_bytes,
+                        }
+                    )
+                    return
+                archived = workflow.archive_all_batches(
+                    profile,
+                    session,
+                    selected,
+                    selection_mode="large_video",
+                    selection_threshold_bytes=summary.threshold_bytes,
+                )
+            _echo(
+                {
+                    "archived_assets": sum(sum(item.counts.values()) for item in archived),
+                    "batch_ids": [item.batch_id for item in archived],
+                    "batch_size": config.icloud_cleanup.batch_size,
+                    "deletion_performed": False,
+                    "profile_id": profile,
+                    "selection_mode": "large_video",
+                    "status": "ready_for_group_cleanup",
+                    "threshold_bytes": summary.threshold_bytes,
+                }
+            )
+        finally:
+            session.close()
+    except (KeyError, OSError, RuntimeError, ValidationError, ValueError, PhotoArchiveError) as exc:
+        _fail(exc)
+
+
 @icloud_app.command("cleanup-ready")
 def icloud_cleanup_ready(
     ctx: typer.Context,
@@ -859,6 +1216,8 @@ def icloud_cleanup_ready(
                         "batch_id": plan.batch_id,
                         "bytes": plan.total_bytes,
                         "plan_sha256": plan.plan_sha256,
+                        "selection_mode": plan.selection_mode,
+                        "selection_threshold_bytes": plan.selection_threshold_bytes,
                     }
                     for plan in plans
                 ]
@@ -874,6 +1233,11 @@ def icloud_cleanup_ready(
                             "aggregate_plan_sha256": aggregate_sha256,
                             "assets": sum(len(plan.assets) for plan in grouped),
                             "chunks": len(grouped),
+                            "large_video_assets": sum(
+                                len(plan.assets)
+                                for plan in grouped
+                                if plan.selection_mode == "large_video"
+                            ),
                             "profile_id": profile,
                             "status": "ready_for_group_cleanup",
                         }
@@ -907,6 +1271,11 @@ def icloud_cleanup_ready(
                     "completed_chunks": completed_chunks,
                     "deleted": deleted,
                     "failed": failed,
+                    "large_video_assets": sum(
+                        len(plan.assets)
+                        for plan in grouped
+                        if plan.selection_mode == "large_video"
+                    ),
                     "profile_id": profile,
                     "recently_deleted_action_required": deleted > 0,
                     "status": "completed" if failed == 0 else "stopped_after_failure",

@@ -579,7 +579,7 @@ class ArchiveRunner:
             ],
             "exporter": {
                 "name": "photoarchive",
-                "version": "0.5.0",
+                "version": "0.6.0",
                 "exported_at_utc": asset["created_at"],
             },
         }

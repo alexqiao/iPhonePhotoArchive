@@ -648,6 +648,9 @@ class Database:
         job_id: str,
         library_id: str,
         cutoff_at_utc: str,
+        *,
+        selection_mode: str = "age_cutoff",
+        selection_threshold_bytes: int | None = None,
     ) -> None:
         now = utc_now()
         with self.connect() as connection:
@@ -656,10 +659,21 @@ class Database:
                 """
                 INSERT INTO icloud_batches(
                     batch_id, profile_id, job_id, library_id, cutoff_at_utc,
+                    selection_mode, selection_threshold_bytes,
                     state, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 'ARCHIVING', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ARCHIVING', ?, ?)
                 """,
-                (batch_id, profile_id, job_id, library_id, cutoff_at_utc, now, now),
+                (
+                    batch_id,
+                    profile_id,
+                    job_id,
+                    library_id,
+                    cutoff_at_utc,
+                    selection_mode,
+                    selection_threshold_bytes,
+                    now,
+                    now,
+                ),
             )
             assets = connection.execute(
                 "SELECT asset_id FROM job_assets WHERE job_id = ? ORDER BY asset_id",
@@ -677,6 +691,58 @@ class Database:
                     (record_id, batch_id, row["asset_id"]),
                 )
             connection.execute("COMMIT")
+
+    def icloud_video_measurements(
+        self, profile_id: str, threshold_bytes: int
+    ) -> dict[tuple[str, str], sqlite3.Row]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM icloud_video_measurements
+                WHERE profile_id = ? AND threshold_bytes = ?
+                """,
+                (profile_id, threshold_bytes),
+            ).fetchall()
+        return {
+            (str(row["photos_local_id"]), str(row["resource_key"])): row
+            for row in rows
+        }
+
+    def record_icloud_video_measurement(
+        self,
+        profile_id: str,
+        photos_local_id: str,
+        resource_key: str,
+        threshold_bytes: int,
+        *,
+        observed_bytes: int,
+        complete: bool,
+        exceeds_threshold: bool,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO icloud_video_measurements(
+                    profile_id, photos_local_id, resource_key, threshold_bytes,
+                    observed_bytes, complete, exceeds_threshold, measured_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(profile_id, photos_local_id, resource_key, threshold_bytes)
+                DO UPDATE SET observed_bytes = excluded.observed_bytes,
+                              complete = excluded.complete,
+                              exceeds_threshold = excluded.exceeds_threshold,
+                              measured_at = excluded.measured_at
+                """,
+                (
+                    profile_id,
+                    photos_local_id,
+                    resource_key,
+                    threshold_bytes,
+                    observed_bytes,
+                    int(complete),
+                    int(exceeds_threshold),
+                    utc_now(),
+                ),
+            )
 
     def get_icloud_batch(self, batch_id: str) -> sqlite3.Row:
         with self.connect() as connection:
@@ -740,6 +806,23 @@ class Database:
                 ORDER BY icloud_batches.created_at, icloud_batches.batch_id
                 """,
                 (profile_id,),
+            ).fetchall()
+
+    def list_icloud_pipeline_batches(
+        self, profile_id: str, selection_mode: str
+    ) -> Sequence[sqlite3.Row]:
+        """Return prior batches that may contribute work to a sync-all run."""
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT *
+                FROM icloud_batches
+                WHERE profile_id = ?
+                  AND selection_mode = ?
+                  AND state != 'COMPLETED'
+                ORDER BY created_at, batch_id
+                """,
+                (profile_id, selection_mode),
             ).fetchall()
 
     def set_icloud_batch_state(
@@ -822,15 +905,24 @@ class Database:
                        icloud_batch_assets.asset_id,
                        icloud_batch_assets.cleanup_state,
                        assets.state AS archive_state,
+                       assets.media_type,
                        assets.review_required,
+                       icloud_batches.selection_mode,
+                       icloud_batches.selection_threshold_bytes,
                        COUNT(CASE WHEN asset_resources.required = 1 THEN 1 END) AS required_count,
                        SUM(CASE WHEN asset_resources.required = 1
                                       AND archive_files.id IS NOT NULL
                                       AND asset_resources.actual_size IS NOT NULL
                                       AND asset_resources.sha256 IS NOT NULL
                                       AND asset_resources.quickxor IS NOT NULL
-                                THEN 1 ELSE 0 END) AS archived_count
+                                THEN 1 ELSE 0 END) AS archived_count,
+                       SUM(CASE WHEN asset_resources.resource_type = 'video'
+                                      AND asset_resources.actual_size >
+                                          COALESCE(icloud_batches.selection_threshold_bytes, -1)
+                                THEN 1 ELSE 0 END) AS qualifying_original_video_count
                 FROM icloud_batch_assets
+                JOIN icloud_batches
+                  ON icloud_batches.batch_id = icloud_batch_assets.batch_id
                 JOIN assets ON assets.id = icloud_batch_assets.asset_id
                 LEFT JOIN asset_resources ON asset_resources.asset_id = assets.id
                 LEFT JOIN archive_files ON archive_files.resource_id = asset_resources.id

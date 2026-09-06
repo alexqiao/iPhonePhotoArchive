@@ -125,10 +125,10 @@ public func runCommand(_ command: String, requestID: String) -> CommandResult {
                 requestID: requestID,
                 payload: [
                     "name": .string("photoarchive-media-helper"),
-                    "version": .string("0.5.0"),
+                    "version": .string("0.6.0"),
                     "schema_version": .integer(1),
                     "phone_schema_version": .integer(2),
-                    "photo_library_schema_version": .integer(3),
+                    "photo_library_schema_version": .integer(4),
                 ]
             ),
             exitCode: 0
@@ -141,7 +141,7 @@ public func runCommand(_ command: String, requestID: String) -> CommandResult {
                 payload: [
                     "contract": .string("ok"),
                     "phone_contract": .string("jsonl-v2"),
-                    "photo_library_contract": .string("jsonl-v3"),
+                    "photo_library_contract": .string("jsonl-v4"),
                 ]
             ),
             exitCode: 0

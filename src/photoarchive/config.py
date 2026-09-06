@@ -30,6 +30,10 @@ class ArchivePolicy(BaseModel):
     cutoff_date: date | None = None
     media_types: list[MediaType] = Field(default_factory=_default_media_types)
     batch_size: int = Field(default=100, ge=1, le=10_000)
+    large_video_threshold_bytes: int = Field(
+        default=100 * 1024 * 1024,
+        ge=1,
+    )
 
     @field_validator("media_types")
     @classmethod
@@ -226,6 +230,9 @@ class AppConfig(BaseSettings):
         # Operational chunk sizing may change between runs without changing any
         # source selection, archive identity, hash, or verification evidence.
         payload["icloud_cleanup"].pop("batch_size", None)
+        # Large-video selection is stored immutably on its dedicated iCloud batch.
+        # Excluding the new default also keeps pre-0.6 archive jobs resumable.
+        payload["archive_policy"].pop("large_video_threshold_bytes", None)
         encoded = json.dumps(
             payload,
             ensure_ascii=False,

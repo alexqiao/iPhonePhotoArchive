@@ -15,10 +15,10 @@
 - Python 3.12：CLI、配置、SQLite、归档状态机、哈希、验证、报告和手机工作流。
 - Swift 6.3：通过 ImageCaptureCore 枚举、下载、复核和删除 iPhone 媒体。
 - Swift PhotoKit：枚举系统用户图库、按需下载 iCloud 资源、复核和删除已确认资产。
-- SQLite：`var/photoarchive.sqlite3`，迁移已应用至 `007_icloud_photos.sql`。
+- SQLite：`var/photoarchive.sqlite3`；代码已包含 `008_icloud_large_videos.sql`，实机运行新命令前需执行迁移。
 - 外接盘：由 `config/local.yaml` 中的卷名和卷 UUID 双重绑定。
 - Swift helper：`native/photos-helper/build/PhotoArchiveMediaHelper.app`。
-- 当前应用和 helper 版本：`0.5.0`；手机协议为 JSONL v2，PhotoKit 协议为 JSONL v3。
+- 当前应用和 helper 版本：`0.6.0`；手机协议为 JSONL v2，PhotoKit 协议为 JSONL v4。
 - 原始需求 DOCX 保留在项目根目录。
 - 当前目录是 Git 仓库，当前分支为 `main`；本轮修改尚未提交。
 
@@ -39,6 +39,14 @@
 
 ## 已完成能力
 
+### 不限时间的大视频迁移
+
+新增 `icloud large-video scan|sync|sync-all|archive-night`。该流程只针对系统照片图库中的普通
+视频资产，以 PhotoKit `.video` 原始资源严格大于 100 MiB 为条件，不限制拍摄时间，
+并归档入选资产的全部关联资源。`scan` 不下载原件；`sync` 和 `archive-night` 使用公开
+PhotoKit 数据流按需测量并缓存结果。大视频批次会固化选择模式和阈值，清理仍复用现有
+人工确认、外接盘证据复核和“最近删除”机制。
+
 ### iCloud Photos 扫描、归档与清理
 
 新增独立命令：
@@ -46,6 +54,7 @@
 ```bash
 .venv/bin/photoarchive --config config/local.yaml icloud scan --profile wife
 .venv/bin/photoarchive --config config/local.yaml icloud sync --profile wife
+.venv/bin/photoarchive --config config/local.yaml icloud sync-all --profile wife
 .venv/bin/photoarchive --config config/local.yaml icloud archive-night --profile wife
 .venv/bin/photoarchive --config config/local.yaml icloud cleanup-ready --profile wife
 .venv/bin/photoarchive --config config/local.yaml icloud cleanup --batch-id '<batch_id>'
@@ -58,6 +67,12 @@
 严格按“最多 1000 项删除前复核 → PhotoKit 删除该批 → 下一批”循环执行。
 已验证的 PhotoKit local identifier 会跨批次排除，避免夜间重复下载。旧的大批次
 不会被 `resume` 意外继续归档。
+
+新增 `icloud sync-all` 完整流水线：初始扫描冻结候选集合并生成授权范围 SHA-256，用户
+确认一次后，程序先清理历史验证队列、恢复不超过批次上限的中断任务，再按“归档最多
+1000 项 → 精确复核并删除 → 下一批”自动循环。任何不完整归档、资产变化、计划漂移或
+删除失败都会立即停止；重新运行必须重新扫描并确认。`icloud large-video sync-all` 提供
+相同的大视频流水线，并保留历史批次各自固化的大小阈值。
 
 `icloud scan` 使用公开 PhotoKit API 枚举系统用户图库，包括云端占位资产、隐藏资产和完整连拍，不下载原件。PhotoKit 没有公开的云端资源大小元数据，所以扫描阶段只报告资产数与资源数，容量在下载归档后才确定。
 
@@ -262,7 +277,7 @@ native/photos-helper/scripts/build_app.sh
 .venv/bin/pytest
 ```
 
-当前结果：Ruff 全部通过，mypy 检查 24 个源文件成功，80 项 Python 测试通过。helper 构建、自检和版本检查成功，报告版本 `0.5.0`、手机 schema 2、PhotoKit schema 3。由于本机 Command Line Tools 的 SwiftPM manifest 库版本不一致，以下命令会在载入 `Package.swift` 时出现链接错误：
+当前结果：Ruff 全部通过，mypy 检查 24 个源文件成功，90 项 Python 测试通过。helper 构建、自检和版本检查成功，报告版本 `0.6.0`、手机 schema 2、PhotoKit schema 4。由于本机 Command Line Tools 的 SwiftPM manifest 库版本不一致，以下命令会在载入 `Package.swift` 时出现链接错误：
 
 ```bash
 swift test --package-path native/photos-helper

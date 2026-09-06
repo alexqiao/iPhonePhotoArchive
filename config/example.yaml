@@ -5,6 +5,7 @@ archive_policy:
   cutoff_date: null
   media_types: [image, video, live_photo]
   batch_size: 100
+  large_video_threshold_bytes: 104857600
 storage:
   database_path: ./var/photoarchive.sqlite3
   staging_root: ./var/staging
