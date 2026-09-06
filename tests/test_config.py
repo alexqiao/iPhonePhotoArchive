@@ -65,3 +65,16 @@ def test_distinct_roots_are_required(tmp_path: Path) -> None:
 
 def test_config_fingerprint_is_stable(app_config: AppConfig) -> None:
     assert app_config.fingerprint() == app_config.model_copy(deep=True).fingerprint()
+
+
+def test_icloud_batch_size_does_not_change_archive_evidence_fingerprint(
+    app_config: AppConfig,
+) -> None:
+    changed = app_config.model_copy(
+        update={
+            "icloud_cleanup": app_config.icloud_cleanup.model_copy(
+                update={"batch_size": 1000}
+            )
+        }
+    )
+    assert changed.fingerprint() == app_config.fingerprint()

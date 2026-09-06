@@ -137,6 +137,7 @@ class ICloudCleanupConfig(BaseModel):
     enabled: bool = False
     confirmation_mode: Literal["per_batch"] = "per_batch"
     command_timeout_sec: float = Field(default=3600, ge=30, le=86_400)
+    batch_size: int = Field(default=1000, ge=1, le=10_000)
 
 
 class ExternalDriveConfig(BaseModel):
@@ -222,6 +223,9 @@ class AppConfig(BaseSettings):
 
     def fingerprint(self) -> str:
         payload = self.model_dump(mode="json")
+        # Operational chunk sizing may change between runs without changing any
+        # source selection, archive identity, hash, or verification evidence.
+        payload["icloud_cleanup"].pop("batch_size", None)
         encoded = json.dumps(
             payload,
             ensure_ascii=False,

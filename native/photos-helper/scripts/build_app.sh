@@ -41,6 +41,7 @@ swiftc \
 
 codesign --force --deep --options runtime \
   --entitlements "$package_root/PhotoArchiveMediaHelper.entitlements" \
+  --requirements '=designated => identifier "com.photoarchive.photos-helper"' \
   --sign - "$app_root"
 
 lsregister="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"

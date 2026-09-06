@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import sqlite3
@@ -15,7 +16,12 @@ from pydantic import ValidationError
 from photoarchive.batches import BatchManager
 from photoarchive.config import AppConfig, load_config
 from photoarchive.database import Database
-from photoarchive.domain import ICloudCleanupComplete, PhoneCleanupComplete, PhotoArchiveError
+from photoarchive.domain import (
+    ICloudCleanupComplete,
+    PhoneCleanupComplete,
+    PhoneSafetyError,
+    PhotoArchiveError,
+)
 from photoarchive.external_drive import ExternalDriveClient
 from photoarchive.fake_archive import FakeArchiveTarget
 from photoarchive.fixture import FixturePhotosClient
@@ -239,6 +245,10 @@ def _icloud_progress(event: str, details: dict[str, Any]) -> None:
         ),
         "ICLOUD_ARCHIVE_COMPLETED": f"iCloud 原件归档完成: {details.get('counts', {})}",
         "ICLOUD_CLEANUP_REVALIDATION_STARTED": "正在重新核对 iCloud 资产与外接盘证据",
+        "DELETE_EVIDENCE_ASSET_STARTED": (
+            f"[删除前核验 {details.get('current', 0)}/{details.get('total', 0)}] "
+            f"资产 {details.get('asset_key', '')}"
+        ),
         "ICLOUD_CLEANUP_READY": (
             f"iCloud 删除计划就绪: {details.get('assets', 0)} 个资产, "
             f"{details.get('resources', 0)} 个资源, "
@@ -307,6 +317,20 @@ def _icloud_cleanup_prompt(plan: ICloudCleanupPlan) -> str:
         f"older than {plan.cutoff_at_utc} from the ENTIRE iCloud Photos library? "
         "This affects every device using this Apple Account. Items move to Recently Deleted; "
         "permanently delete them there manually if you need the iCloud space immediately."
+    )
+
+
+def _icloud_group_cleanup_prompt(
+    plans: tuple[ICloudCleanupPlan, ...], aggregate_sha256: str
+) -> str:
+    assets = sum(len(plan.assets) for plan in plans)
+    total_bytes = sum(plan.total_bytes for plan in plans)
+    batches = len({plan.batch_id for plan in plans})
+    return (
+        f"Delete {assets} verified assets ({total_bytes} archived bytes) from "
+        f"{batches} archive batches in {len(plans)} chunks? "
+        f"Aggregate plan SHA-256: {aggregate_sha256}. "
+        "This affects every device using this Apple Account. Items move to Recently Deleted."
     )
 
 
@@ -640,6 +664,13 @@ def _finish_icloud_cleanup(
                     "recently_deleted_action_required": True,
                 },
             )
+        chunks = workflow.split_cleanup_plan(plan)
+        if len(chunks) != 1:
+            raise PhoneSafetyError(
+                "this legacy batch exceeds the configured iCloud batch size; "
+                "use 'icloud cleanup-ready --profile <profile>' for bounded deletion"
+            )
+        plan = chunks[0]
         if not yes and not typer.confirm(_icloud_cleanup_prompt(plan)):
             return _icloud_report(
                 workflow,
@@ -705,17 +736,18 @@ def icloud_sync(
         try:
             with FileLock(_lock_path(config)):
                 scan, summary = workflow.scan(profile, session)
-                if not scan.assets:
+                remaining = workflow.unarchived_scan(profile, scan)
+                if not remaining.assets:
                     _echo(
                         {
                             "candidate_assets": 0,
                             "cutoff_at_utc": summary.cutoff_at_utc,
                             "profile_id": profile,
-                            "status": "no_candidates",
+                            "status": "no_unarchived_candidates",
                         }
                     )
                     return
-                archived = workflow.archive_scan(profile, session, scan)
+                archived = workflow.archive_scan(profile, session, remaining)
                 plan = workflow.prepare_cleanup(archived.batch_id, session)
                 if not typer.confirm(_icloud_cleanup_prompt(plan)):
                     _echo(
@@ -738,7 +770,8 @@ def icloud_sync(
                     {
                         "batch_id": archived.batch_id,
                         "job_id": archived.job_id,
-                        "candidate_assets": summary.candidate_assets,
+                        "candidate_assets": sum(archived.counts.values()),
+                        "batch_size": config.icloud_cleanup.batch_size,
                         "archived_bytes": plan.total_bytes,
                         "plan_sha256": plan.plan_sha256,
                         "recently_deleted_action_required": result["deleted"] > 0,
@@ -751,6 +784,135 @@ def icloud_sync(
                     },
                 )
             _echo(payload)
+        finally:
+            session.close()
+    except typer.Abort:
+        raise
+    except (KeyError, OSError, RuntimeError, ValidationError, ValueError, PhotoArchiveError) as exc:
+        _fail(exc)
+
+
+@icloud_app.command("archive-night")
+def icloud_archive_night(
+    ctx: typer.Context,
+    profile: Annotated[str, typer.Option("--profile")],
+) -> None:
+    """Archive all remaining candidates in small batches without deleting Photos."""
+    try:
+        config = _config(ctx)
+        database = _database(config)
+        database.migrate()
+        workflow = _icloud_workflow(config, database)
+        session = workflow.client.open_session()
+        try:
+            with FileLock(_lock_path(config)):
+                scan, summary = workflow.scan(profile, session)
+                remaining = workflow.unarchived_scan(profile, scan)
+                if not remaining.assets:
+                    _echo(
+                        {
+                            "candidate_assets": 0,
+                            "profile_id": profile,
+                            "status": "no_unarchived_candidates",
+                        }
+                    )
+                    return
+                archived = workflow.archive_all_batches(profile, session, remaining)
+            _echo(
+                {
+                    "archived_assets": sum(sum(item.counts.values()) for item in archived),
+                    "batch_ids": [item.batch_id for item in archived],
+                    "batch_size": config.icloud_cleanup.batch_size,
+                    "cutoff_at_utc": summary.cutoff_at_utc,
+                    "deletion_performed": False,
+                    "profile_id": profile,
+                    "status": "ready_for_group_cleanup",
+                }
+            )
+        finally:
+            session.close()
+    except (KeyError, OSError, RuntimeError, ValidationError, ValueError, PhotoArchiveError) as exc:
+        _fail(exc)
+
+
+@icloud_app.command("cleanup-ready")
+def icloud_cleanup_ready(
+    ctx: typer.Context,
+    profile: Annotated[str, typer.Option("--profile")],
+) -> None:
+    """Confirm once, then delete all verified batches in bounded PhotoKit chunks."""
+    try:
+        config = _config(ctx)
+        database = _database(config)
+        database.migrate()
+        workflow = _icloud_workflow(config, database)
+        session = workflow.client.open_session()
+        try:
+            with FileLock(_lock_path(config)):
+                plans = workflow.preview_cleanup_plans(profile)
+                if not plans:
+                    _echo({"profile_id": profile, "status": "no_verified_assets_ready"})
+                    return
+                index = [
+                    {
+                        "assets": len(plan.assets),
+                        "batch_id": plan.batch_id,
+                        "bytes": plan.total_bytes,
+                        "plan_sha256": plan.plan_sha256,
+                    }
+                    for plan in plans
+                ]
+                aggregate_sha256 = hashlib.sha256(
+                    json.dumps(index, separators=(",", ":"), sort_keys=True).encode()
+                ).hexdigest()
+                grouped = tuple(plans)
+                if not typer.confirm(
+                    _icloud_group_cleanup_prompt(grouped, aggregate_sha256)
+                ):
+                    _echo(
+                        {
+                            "aggregate_plan_sha256": aggregate_sha256,
+                            "assets": sum(len(plan.assets) for plan in grouped),
+                            "chunks": len(grouped),
+                            "profile_id": profile,
+                            "status": "ready_for_group_cleanup",
+                        }
+                    )
+                    return
+                deleted = 0
+                failed = 0
+                completed_chunks = 0
+                for expected_plan in grouped:
+                    identifiers = frozenset(
+                        asset.local_identifier for asset in expected_plan.assets
+                    )
+                    plan = workflow.prepare_cleanup(
+                        expected_plan.batch_id,
+                        session,
+                        local_identifiers=identifiers,
+                    )
+                    if plan.plan_sha256 != expected_plan.plan_sha256:
+                        raise PhoneSafetyError(
+                            "iCloud deletion plan changed during chunk verification"
+                        )
+                    result = workflow.execute_cleanup(plan, session)
+                    deleted += result["deleted"]
+                    failed += result["failed"]
+                    completed_chunks += 1
+                    if result["failed"]:
+                        break
+            _echo(
+                {
+                    "aggregate_plan_sha256": aggregate_sha256,
+                    "completed_chunks": completed_chunks,
+                    "deleted": deleted,
+                    "failed": failed,
+                    "profile_id": profile,
+                    "recently_deleted_action_required": deleted > 0,
+                    "status": "completed" if failed == 0 else "stopped_after_failure",
+                    "total_chunks": len(grouped),
+                }
+            )
         finally:
             session.close()
     except typer.Abort:
@@ -793,7 +955,16 @@ def icloud_resume(
         with FileLock(_lock_path(config)):
             batch = database.get_icloud_batch(batch_id)
             counts = database.state_counts(str(batch["job_id"]))
-            if batch["state"] == "ARCHIVING" or counts.get("FAILED", 0) > 0:
+            incomplete = sum(
+                count for state, count in counts.items() if state != "SAFE_TO_DELETE"
+            )
+            if incomplete:
+                if sum(counts.values()) > config.icloud_cleanup.batch_size:
+                    raise PhoneSafetyError(
+                        "legacy iCloud batch is larger than the configured batch size; "
+                        "use cleanup-ready for its verified assets and archive-night "
+                        "for the remaining library"
+                    )
                 session = workflow.client.open_session()
                 try:
                     workflow.resume_archive(batch_id, session)

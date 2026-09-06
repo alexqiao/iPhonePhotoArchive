@@ -700,6 +700,48 @@ class Database:
             ).fetchone()
         return cast(sqlite3.Row | None, row)
 
+    def verified_icloud_local_ids(self, profile_id: str) -> set[str]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT assets.photos_local_id
+                FROM icloud_batch_assets
+                JOIN icloud_batches
+                  ON icloud_batches.batch_id = icloud_batch_assets.batch_id
+                JOIN assets ON assets.id = icloud_batch_assets.asset_id
+                WHERE icloud_batches.profile_id = ?
+                  AND assets.state = 'SAFE_TO_DELETE'
+                  AND assets.review_required = 0
+                """,
+                (profile_id,),
+            ).fetchall()
+        return {str(row["photos_local_id"]) for row in rows}
+
+    def list_icloud_batches_with_verified_assets(
+        self, profile_id: str
+    ) -> Sequence[sqlite3.Row]:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT DISTINCT icloud_batches.*
+                FROM icloud_batches
+                JOIN icloud_batch_assets
+                  ON icloud_batch_assets.batch_id = icloud_batches.batch_id
+                JOIN assets ON assets.id = icloud_batch_assets.asset_id
+                WHERE icloud_batches.profile_id = ?
+                  AND icloud_batches.state IN (
+                      'READY_FOR_ICLOUD_CLEANUP',
+                      'COMPLETED_WITH_ITEMS_REMAINING',
+                      'NEEDS_ATTENTION'
+                  )
+                  AND icloud_batch_assets.cleanup_state != 'DELETED'
+                  AND assets.state = 'SAFE_TO_DELETE'
+                  AND assets.review_required = 0
+                ORDER BY icloud_batches.created_at, icloud_batches.batch_id
+                """,
+                (profile_id,),
+            ).fetchall()
+
     def set_icloud_batch_state(
         self,
         batch_id: str,

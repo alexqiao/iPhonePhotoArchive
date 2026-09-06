@@ -54,6 +54,25 @@ PhotoKit 没有公开、无需下载即可读取每个云端原件字节数的�
 .venv/bin/photoarchive --config config/local.yaml icloud sync --profile wife
 ```
 
+`icloud sync` 是白天交互模式：每次最多处理 `icloud_cleanup.batch_size`
+个资产（默认 1000），完成归档与验证后显示该批删除计划并等待一次人工确认。
+
+夜间无人值守时只归档和验证，不删除系统照片：
+
+```bash
+.venv/bin/photoarchive --config config/local.yaml icloud archive-night --profile wife
+```
+
+第二天可把所有已验证的小批次汇总成一个不可变计划；确认一次后，程序仍按
+最多 1000 个资产的 PhotoKit 事务依次删除：
+
+```bash
+.venv/bin/photoarchive --config config/local.yaml icloud cleanup-ready --profile wife
+```
+
+夜间命令不会接受预先授权或自动确认删除，因为最终文件哈希和删除计划只有在
+归档验证完成后才能确定。
+
 程序会逐项执行：
 
 1. 选择严格早于截止时间的照片、视频和 Live Photo。

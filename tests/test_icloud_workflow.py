@@ -102,6 +102,16 @@ class ReadyFakeArchive(FakeArchiveTarget):
         del required_bytes
 
 
+class CountingReadyFakeArchive(ReadyFakeArchive):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.stat_calls = 0
+
+    def stat(self, remote_path: str):
+        self.stat_calls += 1
+        return super().stat(remote_path)
+
+
 def icloud_config(app_config: AppConfig) -> AppConfig:
     return app_config.model_copy(
         update={
@@ -122,6 +132,88 @@ def library_scan() -> PhotoLibraryScan:
         (photo, video),
     )
     return PhotoLibraryScan("authorized", (asset,), 12, 15)
+
+
+def multi_asset_scan(count: int) -> tuple[PhotoLibraryScan, dict[str, bytes]]:
+    assets: list[PhotoLibraryAsset] = []
+    content: dict[str, bytes] = {}
+    for index in range(count):
+        key = f"photo-key-{index}"
+        content[key] = f"photo-{index}".encode()
+        assets.append(
+            PhotoLibraryAsset(
+                f"asset-local-id-{index}",
+                datetime(2020, 1, index + 1, tzinfo=UTC),
+                "image",
+                (
+                    PhotoLibraryResource(
+                        key,
+                        "photo",
+                        1,
+                        f"IMG_{index:04d}.HEIC",
+                        "public.heic",
+                        0,
+                    ),
+                ),
+            )
+        )
+    return PhotoLibraryScan("authorized", tuple(assets), count, count), content
+
+
+def test_icloud_archive_uses_bounded_batches_and_skips_verified_assets(
+    app_config: AppConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = icloud_config(app_config)
+    config = base.model_copy(
+        update={
+            "icloud_cleanup": base.icloud_cleanup.model_copy(update={"batch_size": 2})
+        }
+    )
+    remote = ReadyFakeArchive(config.storage.fake_archive_root)
+    monkeypatch.setattr("photoarchive.icloud_workflow.ExternalDriveClient", lambda _: remote)
+    scan, content = multi_asset_scan(5)
+    session = FakePhotoLibrarySession(scan, content)
+    database = Database(config.storage.database_path)
+    database.migrate()
+    database.create_profile("wife", "妻子")
+    workflow = ICloudWorkflow(config, database, FakePhotoLibraryClient(session))
+
+    first = workflow.archive_scan("wife", session, scan)
+    assert first.counts == {"SAFE_TO_DELETE": 2}
+    assert len(workflow.unarchived_scan("wife", scan).assets) == 3
+
+    rest = workflow.archive_all_batches("wife", session, scan)
+    assert [sum(batch.counts.values()) for batch in rest] == [2, 1]
+    assert len(database.verified_icloud_local_ids("wife")) == 5
+
+
+def test_cleanup_plan_splits_large_legacy_batch_without_weakening_digests(
+    app_config: AppConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = icloud_config(app_config)
+    config = base.model_copy(
+        update={
+            "icloud_cleanup": base.icloud_cleanup.model_copy(update={"batch_size": 2})
+        }
+    )
+    remote = ReadyFakeArchive(config.storage.fake_archive_root)
+    monkeypatch.setattr("photoarchive.icloud_workflow.ExternalDriveClient", lambda _: remote)
+    scan, content = multi_asset_scan(5)
+    session = FakePhotoLibrarySession(scan, content)
+    database = Database(config.storage.database_path)
+    database.migrate()
+    database.create_profile("wife", "妻子")
+    workflow = ICloudWorkflow(config, database, FakePhotoLibraryClient(session))
+
+    archived = workflow.archive_scan(
+        "wife", session, scan, candidate_limit=len(scan.assets)
+    )
+    plan = workflow.prepare_cleanup(archived.batch_id, session)
+    chunks = workflow.split_cleanup_plan(plan)
+
+    assert [len(chunk.assets) for chunk in chunks] == [2, 2, 1]
+    assert len({chunk.plan_sha256 for chunk in chunks}) == 3
+    assert sum(chunk.total_bytes for chunk in chunks) == plan.total_bytes
 
 
 def test_icloud_archive_requires_verification_before_explicit_cleanup(
@@ -166,6 +258,78 @@ def test_icloud_archive_requires_verification_before_explicit_cleanup(
     assert report["icloud_cleanup"]["counts"] == {"DELETED": 1}
     assert report["icloud_cleanup"]["recently_deleted_action_required"] is True
     assert csv_path.name == "icloud_cleanup.csv"
+
+
+def test_icloud_cleanup_rehashes_each_remote_resource_once_without_stability_wait(
+    app_config: AppConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = icloud_config(app_config)
+    remote = CountingReadyFakeArchive(config.storage.fake_archive_root)
+    monkeypatch.setattr("photoarchive.icloud_workflow.ExternalDriveClient", lambda _: remote)
+    scan = library_scan()
+    session = FakePhotoLibrarySession(
+        scan,
+        {"photo-key": b"photo-original", "video-key": b"video-original"},
+    )
+    database = Database(config.storage.database_path)
+    database.migrate()
+    database.create_profile("wife", "妻子")
+    progress: list[tuple[str, dict[str, object]]] = []
+    workflow = ICloudWorkflow(
+        config,
+        database,
+        FakePhotoLibraryClient(session),
+        progress=lambda event, details: progress.append((event, details)),
+    )
+    archived = workflow.archive_scan("wife", session, scan)
+    remote.stat_calls = 0
+    monkeypatch.setattr(
+        "photoarchive.pipeline.time.sleep",
+        lambda _seconds: pytest.fail("cleanup verification must not wait between observations"),
+    )
+
+    plan = workflow.prepare_cleanup(archived.batch_id, session)
+
+    assert len(plan.assets) == 1
+    assert remote.stat_calls == 2
+    starts = [details for event, details in progress if event == "DELETE_EVIDENCE_ASSET_STARTED"]
+    assert starts[-1]["current"] == 1
+    assert starts[-1]["total"] == 1
+
+
+def test_icloud_cleanup_can_verify_and_delete_one_confirmed_chunk_at_a_time(
+    app_config: AppConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = icloud_config(app_config)
+    config = base.model_copy(
+        update={
+            "icloud_cleanup": base.icloud_cleanup.model_copy(update={"batch_size": 2})
+        }
+    )
+    remote = CountingReadyFakeArchive(config.storage.fake_archive_root)
+    monkeypatch.setattr("photoarchive.icloud_workflow.ExternalDriveClient", lambda _: remote)
+    scan, content = multi_asset_scan(5)
+    session = FakePhotoLibrarySession(scan, content)
+    database = Database(config.storage.database_path)
+    database.migrate()
+    database.create_profile("wife", "妻子")
+    workflow = ICloudWorkflow(config, database, FakePhotoLibraryClient(session))
+    archived = workflow.archive_scan(
+        "wife", session, scan, candidate_limit=len(scan.assets)
+    )
+
+    previews = workflow.preview_cleanup_plans("wife")
+    assert [len(plan.assets) for plan in previews] == [2, 2, 1]
+    first = previews[0]
+    prepared = workflow.prepare_cleanup(
+        archived.batch_id,
+        session,
+        local_identifiers=frozenset(asset.local_identifier for asset in first.assets),
+    )
+    assert prepared.plan_sha256 == first.plan_sha256
+    assert workflow.execute_cleanup(prepared, session) == {"deleted": 2, "failed": 0}
+    assert len(session.deleted) == 2
+    assert len(workflow.preview_cleanup_plans("wife")) == 2
 
 
 def test_icloud_cleanup_blocks_asset_whose_resource_set_changed(

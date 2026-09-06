@@ -5,6 +5,7 @@ import json
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import batched
 from pathlib import Path
 from typing import Any
 
@@ -114,11 +115,16 @@ class ICloudWorkflow:
         profile_id: str,
         session: PhotoLibrarySession,
         scan: PhotoLibraryScan,
+        *,
+        candidate_limit: int | None = None,
     ) -> ArchivedICloudBatch:
         if not self.config.icloud_cleanup.enabled:
             raise PhoneSafetyError("iCloud cleanup is disabled in configuration")
         self.database.get_profile(profile_id)
         ExternalDriveClient(self.config.external_drive).assert_ready()
+        scan = self.unarchived_scan(profile_id, scan)
+        if not scan.assets:
+            raise PhoneSafetyError("no unarchived iCloud assets remain eligible")
         batch_id = self._new_batch_id()
         library_id = f"icloud:{profile_id}:{batch_id}"
         source = PhotoLibraryArchiveSource(
@@ -131,6 +137,7 @@ class ICloudWorkflow:
             self.config,
             self.database,
             source,
+            candidate_limit=candidate_limit or self.config.icloud_cleanup.batch_size,
             target_adapter="external",
         )
         summary = planner.create_job()
@@ -176,6 +183,50 @@ class ICloudWorkflow:
         self._progress("ICLOUD_ARCHIVE_COMPLETED", batch_id=batch_id, counts=counts)
         return ArchivedICloudBatch(batch_id, summary.job_id, counts)
 
+    def unarchived_scan(
+        self, profile_id: str, scan: PhotoLibraryScan
+    ) -> PhotoLibraryScan:
+        archived = self.database.verified_icloud_local_ids(profile_id)
+        assets = tuple(
+            asset for asset in scan.assets if asset.local_identifier not in archived
+        )
+        return PhotoLibraryScan(
+            authorization=scan.authorization,
+            assets=assets,
+            total_assets=scan.total_assets,
+            total_resources=scan.total_resources,
+            warnings=scan.warnings,
+        )
+
+    def archive_all_batches(
+        self,
+        profile_id: str,
+        session: PhotoLibrarySession,
+        scan: PhotoLibraryScan,
+    ) -> tuple[ArchivedICloudBatch, ...]:
+        remaining = self.unarchived_scan(profile_id, scan)
+        completed: list[ArchivedICloudBatch] = []
+        for group in batched(remaining.assets, self.config.icloud_cleanup.batch_size):
+            subset = PhotoLibraryScan(
+                authorization=remaining.authorization,
+                assets=tuple(group),
+                total_assets=remaining.total_assets,
+                total_resources=remaining.total_resources,
+                warnings=remaining.warnings,
+            )
+            archived = self.archive_scan(
+                profile_id,
+                session,
+                subset,
+                candidate_limit=len(subset.assets),
+            )
+            completed.append(archived)
+            if archived.counts.get("SAFE_TO_DELETE", 0) != len(subset.assets):
+                raise PhoneSafetyError(
+                    f"night archive stopped after batch {archived.batch_id} needs attention"
+                )
+        return tuple(completed)
+
     def resume_archive(
         self, batch_id: str, session: PhotoLibrarySession
     ) -> ArchivedICloudBatch:
@@ -206,7 +257,11 @@ class ICloudWorkflow:
         return ArchivedICloudBatch(batch_id, str(batch["job_id"]), counts)
 
     def prepare_cleanup(
-        self, batch_id: str, session: PhotoLibrarySession
+        self,
+        batch_id: str,
+        session: PhotoLibrarySession,
+        *,
+        local_identifiers: frozenset[str] | None = None,
     ) -> ICloudCleanupPlan:
         if not self.config.icloud_cleanup.enabled:
             raise PhoneSafetyError("iCloud cleanup is disabled in configuration")
@@ -230,15 +285,35 @@ class ICloudWorkflow:
             profile_id=str(batch["profile_id"]),
             library_id=str(batch["library_id"]),
         )
+        deletion_candidate_ids = {
+            str(row["id"])
+            for row in self.database.list_icloud_batch_assets(batch_id)
+            if row["cleanup_state"] != "DELETED"
+            and row["state"] == "SAFE_TO_DELETE"
+            and (
+                local_identifiers is None
+                or str(row["photos_local_id"]) in local_identifiers
+            )
+        }
         ArchiveRunner(
             self.config,
             self.database,
             source,
             ExternalDriveClient(self.config.external_drive),
             progress=self.progress,
-        ).verify_job(str(batch["job_id"]))
+        ).verify_for_deletion(str(batch["job_id"]), deletion_candidate_ids)
         self._mark_ready_assets(batch_id)
         candidates = self._asset_references(batch_id, {"READY"})
+        if local_identifiers is not None:
+            candidates = tuple(
+                asset
+                for asset in candidates
+                if asset.local_identifier in local_identifiers
+            )
+            if {asset.local_identifier for asset in candidates} != local_identifiers:
+                raise PhoneSafetyError(
+                    "one or more confirmed iCloud assets failed deletion-time verification"
+                )
         if not candidates:
             raise PhoneSafetyError("no fully verified iCloud assets remain eligible for deletion")
         validation = session.revalidate(candidates, cutoff_at_utc=str(batch["cutoff_at_utc"]))
@@ -262,29 +337,45 @@ class ICloudWorkflow:
         selected = tuple(asset for asset in candidates if asset.local_identifier in valid_ids)
         if not selected:
             raise PhoneSafetyError("iCloud asset revalidation failed; deletion is blocked")
-        payload = self._plan_payload(batch, selected)
-        digest = hashlib.sha256(
-            json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
-        ).hexdigest()
-        total_bytes = sum(
-            int(resource["size"])
-            for asset in payload["assets"]
-            for resource in asset["resources"]
-        )
+        plan = self._cleanup_plan(batch, selected)
         self._progress(
             "ICLOUD_CLEANUP_READY",
             assets=len(selected),
             resources=sum(len(asset.resources) for asset in selected),
-            bytes=total_bytes,
+            bytes=plan.total_bytes,
         )
-        return ICloudCleanupPlan(
-            batch_id=batch_id,
-            profile_id=str(batch["profile_id"]),
-            cutoff_at_utc=str(batch["cutoff_at_utc"]),
-            plan_sha256=digest,
-            assets=selected,
-            total_bytes=total_bytes,
+        return plan
+
+    def split_cleanup_plan(
+        self, plan: ICloudCleanupPlan
+    ) -> tuple[ICloudCleanupPlan, ...]:
+        batch = self.database.get_icloud_batch(plan.batch_id)
+        return tuple(
+            self._cleanup_plan(batch, tuple(group))
+            for group in batched(plan.assets, self.config.icloud_cleanup.batch_size)
         )
+
+    def cleanup_batch_ids(self, profile_id: str) -> tuple[str, ...]:
+        return tuple(
+            str(row["batch_id"])
+            for row in self.database.list_icloud_batches_with_verified_assets(profile_id)
+        )
+
+    def preview_cleanup_plans(self, profile_id: str) -> tuple[ICloudCleanupPlan, ...]:
+        """Build exact bounded plans for one confirmation, without remote I/O."""
+        plans: list[ICloudCleanupPlan] = []
+        for batch_id in self.cleanup_batch_ids(profile_id):
+            batch = self.database.get_icloud_batch(batch_id)
+            self._mark_ready_assets(batch_id)
+            candidates = self._asset_references(batch_id, {"READY"})
+            plans.extend(
+                self._cleanup_plan(batch, tuple(group))
+                for group in batched(
+                    candidates,
+                    self.config.icloud_cleanup.batch_size,
+                )
+            )
+        return tuple(plans)
 
     def execute_cleanup(
         self, plan: ICloudCleanupPlan, session: PhotoLibrarySession
@@ -450,6 +541,27 @@ class ICloudWorkflow:
             "cutoff_at_utc": str(batch["cutoff_at_utc"]),
             "assets": planned_assets,
         }
+
+    def _cleanup_plan(
+        self, batch: Any, assets: tuple[PhotoLibraryAsset, ...]
+    ) -> ICloudCleanupPlan:
+        payload = self._plan_payload(batch, assets)
+        digest = hashlib.sha256(
+            json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+        ).hexdigest()
+        total_bytes = sum(
+            int(resource["size"])
+            for asset in payload["assets"]
+            for resource in asset["resources"]
+        )
+        return ICloudCleanupPlan(
+            batch_id=str(batch["batch_id"]),
+            profile_id=str(batch["profile_id"]),
+            cutoff_at_utc=str(batch["cutoff_at_utc"]),
+            plan_sha256=digest,
+            assets=assets,
+            total_bytes=total_bytes,
+        )
 
     def _reconcile_delete_intents(
         self, batch_id: str, session: PhotoLibrarySession

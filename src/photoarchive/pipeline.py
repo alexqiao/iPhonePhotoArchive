@@ -783,6 +783,117 @@ class ArchiveRunner:
                         )
         return self.database.state_counts(job_id)
 
+    def verify_for_deletion(
+        self,
+        job_id: str,
+        asset_ids: set[str] | frozenset[str],
+    ) -> dict[str, int]:
+        """Re-hash archived resources once immediately before a deletion plan.
+
+        The archive pass already requires repeated stable observations.  The
+        deletion pass deliberately performs one fresh, complete observation of
+        every required resource so it detects later disk changes without paying
+        the archive-time stability delay again.
+        """
+        job = self.database.get_job(job_id)
+        if job["config_hash"] != self.config.fingerprint():
+            raise ConfigDriftError("current configuration does not match the saved job")
+        assets = [
+            asset
+            for asset in self.database.list_assets(job_id)
+            if str(asset["id"]) in asset_ids
+            and AssetState(asset["state"]) is AssetState.SAFE_TO_DELETE
+        ]
+        passed_assets = 0
+        for index, asset in enumerate(assets, start=1):
+            asset_id = str(asset["id"])
+            asset_key = asset_id[:8]
+            self._progress(
+                "DELETE_EVIDENCE_ASSET_STARTED",
+                current=index,
+                total=len(assets),
+                asset_key=asset_key,
+            )
+            all_passed = int(asset["unresolved_warning_count"]) == 0
+            resources = [
+                row for row in self.database.list_resources(asset_id) if row["required"]
+            ]
+            all_passed = all_passed and bool(resources)
+            try:
+                for resource in resources:
+                    archived = self.database.get_archive_file(str(resource["id"]))
+                    if archived is None:
+                        all_passed = False
+                        self.database.record_verification(
+                            str(resource["id"]),
+                            "DELETE_REMOTE_MAPPING",
+                            "present",
+                            "missing",
+                            False,
+                            self.run_id,
+                        )
+                        continue
+                    remote = self._with_retry(
+                        partial(self.target.stat, str(archived["remote_path"])),
+                        job_id=job_id,
+                        asset_key=asset_key,
+                    )
+                    checks = {
+                        "DELETE_REMOTE_PATH": (
+                            str(archived["remote_path"]),
+                            str(remote.remote_path),
+                        ),
+                        "DELETE_REMOTE_SIZE": (
+                            str(resource["actual_size"]),
+                            str(remote.size),
+                        ),
+                        "DELETE_REMOTE_SHA256": (
+                            str(resource["sha256"]),
+                            str(remote.etag),
+                        ),
+                        "DELETE_REMOTE_QUICKXOR": (
+                            str(resource["quickxor"]),
+                            str(remote.quickxor),
+                        ),
+                    }
+                    for check_type, (expected, actual) in checks.items():
+                        check_passed = expected == actual
+                        all_passed = all_passed and check_passed
+                        self.database.record_verification(
+                            str(resource["id"]),
+                            check_type,
+                            expected,
+                            actual,
+                            check_passed,
+                            self.run_id,
+                        )
+            except PhotoArchiveError as exc:
+                all_passed = False
+                self.database.set_review_required(asset_id, True, exc.code)
+                self._emit(
+                    exc.code,
+                    level="ERROR",
+                    job_id=job_id,
+                    asset_key=asset_key,
+                )
+            if all_passed:
+                self.database.set_review_required(asset_id, False, None)
+                passed_assets += 1
+            else:
+                self.database.set_review_required(
+                    asset_id,
+                    True,
+                    "DELETE_REMOTE_MISMATCH",
+                )
+            self._progress(
+                "DELETE_EVIDENCE_ASSET_COMPLETED",
+                current=index,
+                total=len(assets),
+                asset_key=asset_key,
+                passed=all_passed,
+            )
+        return {"passed": passed_assets, "failed": len(assets) - passed_assets}
+
     def _recover_asset(self, job_id: str, asset: sqlite3.Row) -> None:
         stable_value = asset["last_stable_state"]
         if stable_value is None:

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import select
 import subprocess
+import tempfile
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -59,20 +62,56 @@ class SwiftPhotoLibrarySession:
         if not helper_path.is_file():
             raise AdapterError(f"Photos helper is missing: {helper_path}")
         self.config = config
-        self.process = subprocess.Popen(
-            [str(helper_path), "photo-library-session"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
+        self.app_path = helper_path.parents[2]
+        if self.app_path.suffix != ".app":
+            raise AdapterError(f"Photos helper is not inside an app bundle: {helper_path}")
+        self._temp = tempfile.TemporaryDirectory(prefix="photoarchive-photokit-")
+        temp = Path(self._temp.name)
+        self._request_path = temp / "request.jsonl"
+        self._response_path = temp / "response.jsonl"
+        self._error_path = temp / "stderr.log"
+        os.mkfifo(self._request_path, mode=0o600)
+        os.mkfifo(self._response_path, mode=0o600)
+
+        # Open both FIFO ends in the parent before asking LaunchServices to open
+        # them for the app. This avoids a writer/reader startup deadlock.
+        request_fd = os.open(self._request_path, os.O_RDWR | os.O_NONBLOCK)
+        response_fd = os.open(self._response_path, os.O_RDWR | os.O_NONBLOCK)
+        try:
+            self.process = subprocess.Popen(
+                [
+                    "open",
+                    "-W",
+                    "-n",
+                    "--stdin",
+                    str(self._request_path),
+                    "--stdout",
+                    str(self._response_path),
+                    "--stderr",
+                    str(self._error_path),
+                    str(self.app_path),
+                    "--args",
+                    "photo-library-session",
+                ]
+            )
+        except OSError as exc:
+            os.close(request_fd)
+            os.close(response_fd)
+            self._temp.cleanup()
+            raise AdapterError("could not launch Photos helper through macOS") from exc
+        os.set_blocking(request_fd, True)
+        os.set_blocking(response_fd, True)
+        self.stdin = os.fdopen(request_fd, "w", buffering=1, encoding="utf-8")
+        self.stdout = os.fdopen(response_fd, "r", buffering=1, encoding="utf-8")
+
+    def _stderr(self) -> str:
+        if not self._error_path.exists():
+            return ""
+        return self._error_path.read_text(encoding="utf-8").strip()
 
     def _exchange(
         self, command: str, payload: dict[str, Any] | None = None
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        if self.process.stdin is None or self.process.stdout is None:
-            raise AdapterError("Photos helper pipes are unavailable")
         request_id = str(uuid.uuid4())
         request = {
             "schema_version": 3,
@@ -80,22 +119,23 @@ class SwiftPhotoLibrarySession:
             "request_id": request_id,
             "payload": {"command": command, **(payload or {})},
         }
-        self.process.stdin.write(json.dumps(request, separators=(",", ":")) + "\n")
-        self.process.stdin.flush()
+
+        # On macOS 26, launching the executable inside an app bundle directly can
+        # make TCC attribute PhotoKit access to the parent CLI process. Launching
+        # through LaunchServices preserves the app identity that the user granted
+        # Full Photos Access to while the FIFOs keep one efficient JSONL session.
+        self.stdin.write(json.dumps(request, separators=(",", ":")) + "\n")
+        self.stdin.flush()
         records: list[dict[str, Any]] = []
         while True:
             ready, _, _ = select.select(
-                [self.process.stdout], [], [], self.config.command_timeout_sec
+                [self.stdout], [], [], self.config.command_timeout_sec
             )
             if not ready:
-                self.close()
                 raise AdapterError(f"Photos helper timed out during {command}")
-            line = self.process.stdout.readline()
+            line = self.stdout.readline()
             if not line:
-                error = ""
-                if self.process.stderr is not None:
-                    error = self.process.stderr.read().strip()
-                raise AdapterError(error or "Photos helper closed unexpectedly")
+                raise AdapterError(self._stderr() or "Photos helper closed unexpectedly")
             try:
                 envelope = cast(dict[str, Any], json.loads(line))
             except json.JSONDecodeError as exc:
@@ -188,17 +228,17 @@ class SwiftPhotoLibrarySession:
         )
 
     def close(self) -> None:
-        if self.process.poll() is not None:
-            return
-        try:
-            self._exchange("close")
-        except (AdapterError, BrokenPipeError, OSError):
-            self.process.terminate()
+        if not self.stdin.closed and self.process.poll() is None:
+            with contextlib.suppress(AdapterError, BrokenPipeError, OSError):
+                self._exchange("close")
+        self.stdin.close()
+        self.stdout.close()
         try:
             self.process.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            self.process.kill()
+            self.process.terminate()
             self.process.wait(timeout=5)
+        self._temp.cleanup()
 
     def __enter__(self) -> SwiftPhotoLibrarySession:
         return self

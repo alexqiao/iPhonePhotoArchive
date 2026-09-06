@@ -27,6 +27,7 @@ icloud_cleanup:
   enabled: false
   confirmation_mode: per_batch
   command_timeout_sec: 3600
+  batch_size: 1000
 external_drive:
   volume_path: /Volumes/ExternalDisk01
   archive_directory: PhotoArchive

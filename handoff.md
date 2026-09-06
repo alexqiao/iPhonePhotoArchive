@@ -6,7 +6,7 @@
 
 这是一个 macOS 14+ 的照片归档程序。程序可以从当前连接并绑定到人员档案的 iPhone，或从 Mac 系统照片图库中的 iCloud Photos，选择严格早于两年截止时间的照片和视频，再归档到名为 `ExternalDisk01` 的外接盘。只有全部必要资源通过大小、SHA-256、QuickXorHash、manifest 和两次稳定性验证后，资产才进入对应来源的清理队列。
 
-手机/PTP 与系统“照片”图库使用完全独立的批次和资产身份。不同人员使用独立 profile。任何会同步影响 iCloud 和同一 Apple 账户其他设备的删除都必须按批次人工确认。
+手机/PTP 与系统“照片”图库使用完全独立的批次和资产身份。不同人员使用独立 profile。任何会同步影响 iCloud 和同一 Apple 账户其他设备的删除都必须经过明确人工确认。
 
 项目不使用 OneDrive 或自建网络 API；仅 iCloud 工作流允许 PhotoKit 按需从 iCloud 下载资源。项目不清空“最近删除”，不使用 AppleScript、UI 自动点击或私有 Apple API。
 
@@ -20,7 +20,7 @@
 - Swift helper：`native/photos-helper/build/PhotoArchiveMediaHelper.app`。
 - 当前应用和 helper 版本：`0.5.0`；手机协议为 JSONL v2，PhotoKit 协议为 JSONL v3。
 - 原始需求 DOCX 保留在项目根目录。
-- 当前目录没有初始化 Git。
+- 当前目录是 Git 仓库，当前分支为 `main`；本轮修改尚未提交。
 
 关键代码：
 
@@ -46,29 +46,36 @@
 ```bash
 .venv/bin/photoarchive --config config/local.yaml icloud scan --profile wife
 .venv/bin/photoarchive --config config/local.yaml icloud sync --profile wife
+.venv/bin/photoarchive --config config/local.yaml icloud archive-night --profile wife
+.venv/bin/photoarchive --config config/local.yaml icloud cleanup-ready --profile wife
 .venv/bin/photoarchive --config config/local.yaml icloud cleanup --batch-id '<batch_id>'
 .venv/bin/photoarchive --config config/local.yaml icloud resume --batch-id '<batch_id>'
 ```
+
+2026-09-06 增加 iCloud 小批次模式：白天 `icloud sync` 每批最多 1000 个资产，
+归档、复核并确认后删除这一批；夜间 `archive-night` 可连续归档和验证但绝不删除；
+`cleanup-ready` 为全部已验证资产生成分块计划及汇总 SHA-256，人工确认一次后，
+严格按“最多 1000 项删除前复核 → PhotoKit 删除该批 → 下一批”循环执行。
+已验证的 PhotoKit local identifier 会跨批次排除，避免夜间重复下载。旧的大批次
+不会被 `resume` 意外继续归档。
 
 `icloud scan` 使用公开 PhotoKit API 枚举系统用户图库，包括云端占位资产、隐藏资产和完整连拍，不下载原件。PhotoKit 没有公开的云端资源大小元数据，所以扫描阶段只报告资产数与资源数，容量在下载归档后才确定。
 
 `icloud sync` 会按需联网下载 `PHAssetResource` 暴露的全部底层资源，沿用现有外接盘哈希、manifest 与两次稳定性验证。每个资产验证成功后会删除程序自己的 staging 临时副本。删除前再次获取精确 `localIdentifier`、检查截止时间和完整资源键集合，并把全部外接盘证据纳入 SHA-256 删除计划。PhotoKit 删除成功后，资产进入系统“最近删除”；程序不清空它，用户若需立即释放空间必须在“照片”App 手动永久删除。
 
-该能力已通过 fake PhotoKit session 的非破坏性测试，但尚未在真实系统图库完成授权、云端下载和破坏性删除验收。
+删除前复核采用一次完整的 SHA-256、QuickXorHash、大小和路径检查；初次归档仍保留两次稳定性检查。`cleanup-ready` 先为所有待删资产生成分块计划并让用户确认一次汇总摘要，随后严格按“最多 1000 项复核 → 删除该批 → 下一批”执行，不会先复核全部候选再开始删除。
+
+该能力已通过 fake PhotoKit session 的非破坏性测试；真实系统图库授权、扫描、iCloud 原件下载和外接盘归档已经实际运行。PhotoKit 破坏性删除尚未确认执行，因此不能宣称真实 iCloud 删除验收完成。
 
 #### 当前实机状态与账号边界
 
-2026-09-05 在当前 macOS 用户下进行过三次只读 `icloud scan` 尝试：首次直接调用、定向重置 Photos TCC 后重试，以及补充 AppKit/LaunchServices 授权流程后再次重试。三次均返回 Photos 权限状态 `denied`。系统设置的“隐私与安全性 → 照片”页面已打开，但 helper 仍未获得“完整访问”。这些尝试没有枚举、下载或删除任何真实照片，也没有创建 iCloud 批次。
+当前项目已安装在照片所有者的独立 macOS 用户下，该用户登录对应的 Apple Account，系统照片图库和 iCloud Photos 已同步，helper 已获得“完整访问”。PhotoKit 仍始终访问当前 macOS 用户的系统照片图库，不能在程序中选择 Apple Account。
 
-随后确认当前 macOS 用户登录的是用户本人的 Apple Account，而待清理的照片属于妻子的 Apple Account。PhotoKit 没有运行时账号选择器，它始终访问**当前 macOS 用户的系统照片图库**。因此：
+旧的大批次 `icloud-20260906-081545-775111c3` 在中断归档时已有 2400 项进入 `SAFE_TO_DELETE`，19700 项仍为 `DISCOVERED`，另有 1 项为 `UPLOADED`。所有 22101 个 iCloud 批次资产目前仍为 `PENDING`，没有生成删除计划、没有确认、没有执行删除。
 
-- 不要在当前用户/当前 Apple Account 下授权或运行 `icloud sync`、`icloud cleanup`。
-- 不建议在当前 macOS 用户中直接切换到妻子的 Apple Account 或切换系统照片图库；错误操作可能造成图库合并，之后无法自动拆分。
-- 推荐为妻子建立独立 macOS 用户，在该用户中登录妻子的 Apple Account，打开“照片”并为其独立系统照片图库启用 iCloud Photos；可使用“优化 Mac 存储空间”，无需先把全部原件下载到内置盘。
-- 等待照片元数据同步后，在妻子的 macOS 用户中准备独立的项目副本、虚拟环境、配置、数据库和 profile，再授予 `PhotoArchive Media Helper`“完整照片访问”。
-- 首次真实操作只运行 `icloud scan --profile wife`。先核对资产数量和截止日期，再决定是否运行下载归档；任何删除仍须由用户亲自确认。
+2026-09-06 17:09（Asia/Shanghai）仍有一次由旧代码启动的 `cleanup-ready` 删除前复核运行中：Python PID `67288`、`caffeinate` PID `67289`、PhotoKit helper PID `67294`。运行 ID 为 `d1e896a5-febb-4f06-b72b-aa2d25e9312a`，当时已完成约 2242/2400 项。运行中的 Python 进程不会热加载后来加入的分块加速逻辑；它完成复核后仍会先显示删除确认，在用户确认前不会删除。
 
-当前用户下的权限拒绝无需继续处理，因为它对应错误的 Apple Account。当前首要下一步是完成妻子独立 macOS 用户的环境和只读扫描，不是继续在当前账号下排查授权。
+若要立即改用新逻辑，可在原终端按 `Ctrl+C` 安全中止当前复核，然后重新运行同一条 `cleanup-ready` 命令。新进程会先显示一次汇总确认，确认后按每批最多 1000 项复核并立即删除；中止旧复核不会删除照片，但旧复核进度不会作为新逻辑的检查点复用。
 
 ### 扫描与容量
 
@@ -111,7 +118,7 @@ Live Photo、RAW+JPEG 等关联资源按一个逻辑项目显示，同时保留�
 [归档 29/42] 完成: SAFE_TO_DELETE
 ```
 
-本地 APFS 外接盘的两次稳定性检查间隔为 1 秒；远程或测试适配器仍可使用配置值。
+初次归档时，本地 APFS 外接盘的两次稳定性检查间隔为 1 秒；远程或测试适配器仍可使用配置值。删除前复核只做一次完整读取，不执行第二次稳定性轮询，也不等待 1 秒。
 
 ### 删除错误诊断
 
@@ -183,9 +190,21 @@ PTP DeleteObject InvalidObjectHandle (0x2009)
 20260905-212224-23206606  COMPLETED_WITH_PHONE_ITEMS_REMAINING
 ```
 
-两批都指向同一组手机项目的历史归档。优先使用较新的 `20260905-212224-23206606` 继续诊断。当前没有运行中的 `photoarchive` 或 `photos-helper` 进程。
+两批都指向同一组手机项目的历史归档。优先使用较新的 `20260905-212224-23206606` 继续诊断。手机/PTP 删除路线与当前 iCloud PhotoKit 进程相互独立。
 
-iCloud 表已经通过 `007_icloud_photos.sql` 建立并通过数据库完整性检查，但目前仍为空：`icloud_batches = 0`、`icloud_batch_assets = 0`。尚无可恢复或清理的 iCloud 批次。
+iCloud 数据库当前有 1 个批次、22101 条批次资产记录：
+
+```text
+batch_id: icloud-20260906-081545-775111c3
+job_id: 3ca6f06b-ae1b-4dc2-ab7b-9f755f7a90e8
+batch state: NEEDS_ATTENTION
+archive states: SAFE_TO_DELETE=2400, DISCOVERED=19700, UPLOADED=1
+cleanup states: PENDING=22101
+deletion_plan_sha256: null
+confirmed_at: null
+```
+
+因此当前事实是“2400 项外接盘归档证据已就绪并正在做删除前复核”，不是“已从 iCloud 删除”。
 
 ## 常用命令
 
@@ -195,14 +214,33 @@ iCloud 表已经通过 `007_icloud_photos.sql` 建立并通过数据库完整性
 .venv/bin/photoarchive --config config/local.yaml phone scan --profile wife
 ```
 
-iCloud 环境检查和首次只读扫描仅应在妻子的独立 macOS 用户、妻子的 Apple Account 和系统照片图库配置完成后运行：
+iCloud 环境检查和只读扫描应在当前妻子的独立 macOS 用户、妻子的 Apple Account 和系统照片图库下运行：
 
 ```bash
 .venv/bin/photoarchive --config config/local.yaml doctor --adapter icloud
 .venv/bin/photoarchive --config config/local.yaml icloud scan --profile wife
 ```
 
-当前 macOS 用户登录的是用户本人的 Apple Account，禁止在当前环境运行 `icloud sync` 或 `icloud cleanup`。
+白天单批归档、核验并确认删除：
+
+```bash
+caffeinate -dimsu .venv/bin/photoarchive --config config/local.yaml \
+  icloud sync --profile wife
+```
+
+夜间仅归档全部剩余候选，绝不删除：
+
+```bash
+caffeinate -dimsu .venv/bin/photoarchive --config config/local.yaml \
+  icloud archive-night --profile wife
+```
+
+对全部已验证资产确认一次，然后按最多 1000 项逐批核验和删除：
+
+```bash
+caffeinate -dimsu .venv/bin/photoarchive --config config/local.yaml \
+  icloud cleanup-ready --profile wife
+```
 
 查看并应用数据库迁移：
 
@@ -224,7 +262,7 @@ native/photos-helper/scripts/build_app.sh
 .venv/bin/pytest
 ```
 
-当前结果：Ruff 全部通过，mypy 检查 24 个源文件成功，75 项 Python 测试通过。helper 构建、自检和版本检查成功，报告版本 `0.5.0`、手机 schema 2、PhotoKit schema 3。由于本机 Command Line Tools 的 SwiftPM manifest 库版本不一致，以下命令会在载入 `Package.swift` 时出现链接错误：
+当前结果：Ruff 全部通过，mypy 检查 24 个源文件成功，80 项 Python 测试通过。helper 构建、自检和版本检查成功，报告版本 `0.5.0`、手机 schema 2、PhotoKit schema 3。由于本机 Command Line Tools 的 SwiftPM manifest 库版本不一致，以下命令会在载入 `Package.swift` 时出现链接错误：
 
 ```bash
 swift test --package-path native/photos-helper
@@ -255,7 +293,7 @@ swift test --package-path native/photos-helper
 - 不清空“最近删除”。
 - macOS Photos 删除只能位于专用 `PhotoLibraryAdapter.swift`，并受独立 iCloud 批次、完整资源复核、外接盘证据和删除计划摘要保护。
 - PhotoKit 始终绑定当前 macOS 用户的系统照片图库，程序不能选择 Apple Account。不同 Apple Account 必须使用独立 macOS 用户、独立系统照片图库、独立配置、数据库和 profile。
-- 当前 macOS 用户登录的是用户本人的 Apple Account；禁止在当前环境运行 `icloud sync` 或 `icloud cleanup`。妻子账号的首次操作只能是只读 `icloud scan`。
+- 当前独立 macOS 用户登录妻子的 Apple Account；执行前仍须确认“照片”所用的系统图库和 Apple Account 没有被切换。
 - PhotoKit 删除会同步影响 iCloud 和同一 Apple Account 的其他设备；必须核对账号、批次和删除计划，并由用户亲自确认。
 - 不使用 AppleScript、UI 自动点击或私有 Apple API。
 - PTP 删除只能位于专用 Swift 手机适配器内，并受现有批次门禁保护。
