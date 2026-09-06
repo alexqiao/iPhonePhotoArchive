@@ -763,11 +763,21 @@ class ICloudWorkflow:
             raise PhoneSafetyError("aggregate iCloud cleanup requires at least one plan")
         profile_ids = {plan.profile_id for plan in plans}
         selection_modes = {plan.selection_mode for plan in plans}
-        cutoffs = {plan.cutoff_at_utc for plan in plans}
-        if len(profile_ids) != 1 or len(selection_modes) != 1 or len(cutoffs) != 1:
+        if len(profile_ids) != 1 or len(selection_modes) != 1:
             raise PhoneSafetyError(
-                "single-transaction iCloud cleanup requires one profile, selection mode, and cutoff"
+                "single-transaction iCloud cleanup requires one profile and selection mode"
             )
+
+        # Every plan is revalidated against its own frozen cutoff before this
+        # method is called. PhotoKit still requires one cutoff for the combined
+        # transaction, so use the latest: an asset that passed an earlier cutoff
+        # necessarily also passes this less restrictive bound.
+        aggregate_cutoff = max(
+            plans,
+            key=lambda plan: datetime.fromisoformat(
+                plan.cutoff_at_utc.replace("Z", "+00:00")
+            ),
+        ).cutoff_at_utc
 
         assets: list[PhotoLibraryAsset] = []
         rows_by_local_id: dict[str, Any] = {}
@@ -824,7 +834,7 @@ class ICloudWorkflow:
         result = session.delete(
             tuple(assets),
             batch_id=f"icloud-aggregate-{aggregate_sha256[:16]}",
-            cutoff_at_utc=plans[0].cutoff_at_utc,
+            cutoff_at_utc=aggregate_cutoff,
             plan_sha256=aggregate_sha256,
             **(
                 {"selection_mode": selection_mode}

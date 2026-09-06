@@ -187,6 +187,10 @@ def _phone_progress(event: str, details: dict[str, Any]) -> None:
         "PHONE_ARCHIVE_STARTED": "开始复制到 ExternalDisk01 并验证",
         "ARCHIVE_RUN_STARTED": f"归档队列共 {details.get('total', 0)} 个资产",
         "ARCHIVE_ASSET_STARTED": f"[归档{position}] 开始",
+        "ARCHIVE_ASSET_FAILED": (
+            f"[归档{position}]{asset_text} 失败: "
+            f"{details.get('error_code', 'UNKNOWN')} - {details.get('message', '未知原因')}"
+        ),
         "ARCHIVE_ASSET_COMPLETED": (
             f"[归档{position}] 完成: {details.get('state', 'UNKNOWN')}"
         ),

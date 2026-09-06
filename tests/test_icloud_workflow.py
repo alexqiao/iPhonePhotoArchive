@@ -34,6 +34,7 @@ class FakePhotoLibrarySession:
         self.downloaded: list[str] = []
         self.probed: list[str] = []
         self.deleted: list[str] = []
+        self.delete_cutoffs: list[str] = []
         self.events: list[tuple[str, tuple[str, ...]]] = []
         self.closed = False
 
@@ -110,6 +111,7 @@ class FakePhotoLibrarySession:
         assert cutoff_at_utc
         assert len(plan_sha256) == 64
         assert selection_mode in {"age_cutoff", "large_video"}
+        self.delete_cutoffs.append(cutoff_at_utc)
         identifiers = tuple(asset.local_identifier for asset in assets)
         self.events.append(("delete", identifiers))
         for identifier in identifiers:
@@ -840,6 +842,43 @@ def test_icloud_cleanup_can_verify_and_delete_one_confirmed_chunk_at_a_time(
     assert workflow.execute_cleanup(prepared, session) == {"deleted": 2, "failed": 0}
     assert len(session.deleted) == 2
     assert len(workflow.preview_cleanup_plans("wife")) == 2
+
+
+def test_aggregate_cleanup_combines_age_batches_with_different_frozen_cutoffs(
+    app_config: AppConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = icloud_config(app_config)
+    remote = ReadyFakeArchive(config.storage.fake_archive_root)
+    monkeypatch.setattr("photoarchive.icloud_workflow.ExternalDriveClient", lambda _: remote)
+    scan, content = multi_asset_scan(2)
+    session = FakePhotoLibrarySession(scan, content)
+    database = Database(config.storage.database_path)
+    database.migrate()
+    database.create_profile("wife", "妻子")
+    workflow = ICloudWorkflow(config, database, FakePhotoLibraryClient(session))
+
+    first_scan = PhotoLibraryScan("authorized", (scan.assets[0],), 2, 2)
+    second_scan = PhotoLibraryScan("authorized", (scan.assets[1],), 2, 2)
+    first = workflow.archive_scan("wife", session, first_scan)
+    second = workflow.archive_scan("wife", session, second_scan)
+    with database.connect() as connection:
+        connection.execute(
+            "UPDATE icloud_batches SET cutoff_at_utc = ? WHERE batch_id = ?",
+            ("2024-01-01T00:00:00Z", first.batch_id),
+        )
+        connection.execute(
+            "UPDATE icloud_batches SET cutoff_at_utc = ? WHERE batch_id = ?",
+            ("2024-01-02T00:00:00Z", second.batch_id),
+        )
+
+    first_plan = workflow.prepare_cleanup(first.batch_id, session)
+    second_plan = workflow.prepare_cleanup(second.batch_id, session)
+    result = workflow.execute_aggregate_cleanup((first_plan, second_plan), session)
+
+    assert result == {"deleted": 2, "failed": 0}
+    assert session.delete_cutoffs == ["2024-01-02T00:00:00Z"]
+    assert database.get_icloud_batch(first.batch_id)["state"] == "COMPLETED"
+    assert database.get_icloud_batch(second.batch_id)["state"] == "COMPLETED"
 
 
 def test_icloud_cleanup_blocks_asset_whose_resource_set_changed(

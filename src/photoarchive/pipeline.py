@@ -409,13 +409,22 @@ class ArchiveRunner:
             else:
                 self.database.set_review_required(asset["id"], True, exc.code)
             self.database.set_job_asset_result(job_id, asset["id"], exc.code)
+            self._progress(
+                "ARCHIVE_ASSET_FAILED",
+                asset_key=short_key,
+                error_code=exc.code,
+                message=str(exc),
+                archive_current=archive_current,
+                archive_total=archive_total,
+            )
             self._emit(
                 exc.code,
                 level="ERROR",
                 job_id=job_id,
                 asset_key=short_key,
+                details={"message": str(exc)},
             )
-        except Exception:
+        except Exception as exc:
             current_row = self.database.get_asset(asset["id"])
             current_state = AssetState(current_row["state"])
             if current_state in {
@@ -434,11 +443,20 @@ class ArchiveRunner:
             else:
                 self.database.set_review_required(asset["id"], True, "INTERNAL_ERROR")
             self.database.set_job_asset_result(job_id, asset["id"], "INTERNAL_ERROR")
+            self._progress(
+                "ARCHIVE_ASSET_FAILED",
+                asset_key=short_key,
+                error_code="INTERNAL_ERROR",
+                message=str(exc),
+                archive_current=archive_current,
+                archive_total=archive_total,
+            )
             self._emit(
                 "INTERNAL_ERROR",
                 level="ERROR",
                 job_id=job_id,
                 asset_key=short_key,
+                details={"message": str(exc)},
             )
 
     def _asset_relative_directory(self, asset: sqlite3.Row) -> PurePosixPath:
