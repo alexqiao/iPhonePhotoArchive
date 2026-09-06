@@ -61,13 +61,15 @@ PhotoKit 没有公开、无需下载即可读取每个云端原件字节数的�
 
 ```bash
 caffeinate -dimsu .venv/bin/photoarchive --config config/local.yaml \
-  icloud sync-all --profile wife
+  icloud sync-all --profile wife --first-batch-size 50
 ```
 
 `sync-all` 会冻结启动时扫描到的候选集合并显示授权范围 SHA-256。确认一次后，它先清理
-已有的验证队列、恢复可安全续传的小批次，再循环执行“归档最多 1000 项 → 删除前完整
-复核 → 删除该批 → 下一批”。运行期间新增的照片不会被纳入；任何归档、复核或删除失败
-都会立即停止，重新运行时必须重新扫描并确认。
+已有的验证队列、恢复可安全续传的小批次，再按最多 1000 项逐批归档。全部候选归档后，
+程序重新核对每个批次的外接盘证据和照片身份，最后把所有兼容计划合并为一个 PhotoKit
+删除事务，因此 macOS 只收到一次系统删除请求。运行期间新增的照片不会被纳入；任何归档、
+复核或删除失败都会立即停止，重新运行时必须重新扫描并确认。首个归档批次默认 50 项，
+后续使用 `icloud_cleanup.batch_size`（默认 1000）；可通过 `--first-batch-size` 调整。
 
 夜间无人值守时只归档和验证，不删除系统照片：
 
@@ -75,13 +77,15 @@ caffeinate -dimsu .venv/bin/photoarchive --config config/local.yaml \
 .venv/bin/photoarchive --config config/local.yaml icloud archive-night --profile wife
 ```
 
-第二天可把所有已验证的小批次汇总成一个不可变计划；确认一次后，程序仍按
-最多 1000 个资产的 PhotoKit 事务依次删除：
+第二天可把所有已验证的小批次逐一复核后合并为一个 PhotoKit 删除事务：
 
 ```bash
 caffeinate -dimsu .venv/bin/photoarchive --config config/local.yaml \
   icloud cleanup-ready --profile wife
 ```
+
+合并事务的 macOS 删除弹窗最多等待 24 小时，允许程序夜间完成复核后停在弹窗处，第二天
+再点击一次“删除”。所有待删批次必须属于同一人员、选择模式和截止时间，否则会拒绝合并。
 
 夜间命令不会接受预先授权或自动确认删除，因为最终文件哈希和删除计划只有在
 归档验证完成后才能确定。
@@ -137,11 +141,11 @@ caffeinate -dimsu .venv/bin/photoarchive --config config/local.yaml \
 
 ```bash
 caffeinate -dimsu .venv/bin/photoarchive --config config/local.yaml \
-  icloud large-video sync-all --profile wife
+  icloud large-video sync-all --profile wife --first-batch-size 50
 ```
 
-该命令同样先冻结候选范围，再逐批归档、验证和删除。历史大视频批次继续使用各自固化的
-阈值，新候选使用当前配置的阈值；任一批失败都会停止后续处理。
+该命令同样先冻结候选范围并逐批归档，全部复核成功后发出一次合并删除请求。历史大视频
+批次继续使用各自固化的阈值，新候选使用当前配置的阈值；任一批失败都会停止处理。
 
 夜间测量并归档全部剩余大视频，但不删除照片图库中的资产：
 

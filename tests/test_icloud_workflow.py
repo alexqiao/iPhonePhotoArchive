@@ -18,7 +18,11 @@ from photoarchive.domain import (
     PhotoLibrarySizeProbe,
 )
 from photoarchive.fake_archive import FakeArchiveTarget
-from photoarchive.icloud_workflow import ArchivedICloudBatch, ICloudWorkflow
+from photoarchive.icloud_workflow import (
+    ArchivedICloudBatch,
+    ICloudCleanupPlan,
+    ICloudWorkflow,
+)
 from photoarchive.reporting import generate_report
 
 
@@ -305,7 +309,7 @@ def test_sync_all_pipeline_archives_deletes_and_continues_in_bounded_order(
     database.create_profile("wife", "妻子")
     workflow = ICloudWorkflow(config, database, FakePhotoLibraryClient(session))
 
-    scope = workflow.build_pipeline_scope("wife", scan)
+    scope = workflow.build_pipeline_scope("wife", scan, first_batch_size=1)
     late_asset = PhotoLibraryAsset(
         "late-asset",
         datetime(2020, 2, 1, tzinfo=UTC),
@@ -324,12 +328,19 @@ def test_sync_all_pipeline_archives_deletes_and_continues_in_bounded_order(
     assert session.events == [
         ("archive", ("asset-local-id-0",)),
         ("archive", ("asset-local-id-1",)),
-        ("delete", ("asset-local-id-0", "asset-local-id-1")),
         ("archive", ("asset-local-id-2",)),
         ("archive", ("asset-local-id-3",)),
-        ("delete", ("asset-local-id-2", "asset-local-id-3")),
         ("archive", ("asset-local-id-4",)),
-        ("delete", ("asset-local-id-4",)),
+        (
+            "delete",
+            (
+                "asset-local-id-0",
+                "asset-local-id-1",
+                "asset-local-id-2",
+                "asset-local-id-3",
+                "asset-local-id-4",
+            ),
+        ),
     ]
 
 
@@ -353,21 +364,21 @@ def test_sync_all_pipeline_drains_verified_backlog_before_new_assets(
     workflow.archive_scan("wife", session, scan)
     session.events.clear()
 
-    scope = workflow.build_pipeline_scope("wife", scan)
+    scope = workflow.build_pipeline_scope("wife", scan, first_batch_size=2)
     result = workflow.execute_pipeline(scope, session)
 
     assert scope.ready_assets == 2
     assert scope.new_assets == 3
     assert result.deleted == 5
-    assert session.events[0] == (
-        "delete",
-        ("asset-local-id-0", "asset-local-id-1"),
-    )
-    assert session.events[1:4] == [
+    assert session.events[:3] == [
         ("archive", ("asset-local-id-2",)),
         ("archive", ("asset-local-id-3",)),
-        ("delete", ("asset-local-id-2", "asset-local-id-3")),
+        ("archive", ("asset-local-id-4",)),
     ]
+    assert session.events[3] == (
+        "delete",
+        tuple(f"asset-local-id-{index}" for index in range(5)),
+    )
 
 
 def test_sync_all_pipeline_resumes_partial_bounded_batch_without_duplicate_archive(
@@ -420,7 +431,7 @@ def test_sync_all_pipeline_resumes_partial_bounded_batch_without_duplicate_archi
         return ArchivedICloudBatch(batch_id, archived.job_id, {"SAFE_TO_DELETE": 2})
 
     monkeypatch.setattr(workflow, "resume_archive", resume)
-    scope = workflow.build_pipeline_scope("wife", scan)
+    scope = workflow.build_pipeline_scope("wife", scan, first_batch_size=2)
 
     assert scope.resume_assets == 2
     assert scope.new_assets == 0
@@ -433,7 +444,7 @@ def test_sync_all_pipeline_resumes_partial_bounded_batch_without_duplicate_archi
     ]
 
 
-def test_sync_all_pipeline_uses_exact_1000_1000_501_chunks_without_heavy_io(
+def test_sync_all_pipeline_uses_50_then_1000_chunks_without_heavy_io(
     app_config: AppConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     base = icloud_config(app_config)
@@ -471,30 +482,44 @@ def test_sync_all_pipeline_uses_exact_1000_1000_501_chunks_without_heavy_io(
             {"SAFE_TO_DELETE": len(subset.assets)},
         )
 
-    def cleanup(batch_id, expected, authorized, active_session):
-        del batch_id, authorized, active_session
-        events.append(("delete", len(expected)))
-        return {"deleted": len(expected), "failed": 0}
+    by_identifier = {asset.local_identifier: asset for asset in assets}
+
+    def prepare(batch_id, expected, authorized, active_session):
+        del authorized, active_session
+        return ICloudCleanupPlan(
+            batch_id=batch_id,
+            profile_id="wife",
+            cutoff_at_utc="2024-01-01T00:00:00Z",
+            plan_sha256="a" * 64,
+            assets=tuple(by_identifier[identifier] for identifier in sorted(expected)),
+            total_bytes=0,
+        )
+
+    def aggregate(plans, active_session):
+        del active_session
+        count = sum(len(plan.assets) for plan in plans)
+        events.append(("delete", count))
+        return {"deleted": count, "failed": 0}
 
     monkeypatch.setattr(workflow, "archive_scan", archive_scan)
-    monkeypatch.setattr(workflow, "_execute_pipeline_cleanup", cleanup)
+    monkeypatch.setattr(workflow, "_prepare_pipeline_cleanup_plan", prepare)
+    monkeypatch.setattr(workflow, "execute_aggregate_cleanup", aggregate)
 
     scope = workflow.build_pipeline_scope("wife", scan)
     result = workflow.execute_pipeline(scope, session)
 
     assert events == [
+        ("archive", 50),
         ("archive", 1000),
-        ("delete", 1000),
         ("archive", 1000),
-        ("delete", 1000),
-        ("archive", 501),
-        ("delete", 501),
+        ("archive", 451),
+        ("delete", 2501),
     ]
-    assert result.completed_chunks == 3
+    assert result.completed_chunks == 4
     assert result.deleted == 2501
 
 
-def test_sync_all_pipeline_stops_before_archiving_the_next_batch_on_delete_failure(
+def test_sync_all_pipeline_archives_all_then_stops_on_single_delete_failure(
     app_config: AppConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     base = icloud_config(app_config)
@@ -514,20 +539,45 @@ def test_sync_all_pipeline_stops_before_archiving_the_next_batch_on_delete_failu
     def archive_scan(*args, **kwargs):
         subset = args[2]
         events.append(("archive", len(subset.assets)))
-        return ArchivedICloudBatch("failed-batch", "failed-job", {"SAFE_TO_DELETE": 2})
+        return ArchivedICloudBatch(
+            "failed-batch",
+            "failed-job",
+            {"SAFE_TO_DELETE": len(subset.assets)},
+        )
 
-    def cleanup(*args, **kwargs):
-        events.append(("delete", 2))
-        return {"deleted": 0, "failed": 2}
+    by_identifier = {asset.local_identifier: asset for asset in scan.assets}
+
+    def prepare(batch_id, expected, authorized, active_session):
+        del authorized, active_session
+        return ICloudCleanupPlan(
+            batch_id=batch_id,
+            profile_id="wife",
+            cutoff_at_utc="2024-01-01T00:00:00Z",
+            plan_sha256="a" * 64,
+            assets=tuple(by_identifier[identifier] for identifier in sorted(expected)),
+            total_bytes=0,
+        )
+
+    def aggregate(plans, active_session):
+        del active_session
+        count = sum(len(plan.assets) for plan in plans)
+        events.append(("delete", count))
+        return {"deleted": 0, "failed": count}
 
     monkeypatch.setattr(workflow, "archive_scan", archive_scan)
-    monkeypatch.setattr(workflow, "_execute_pipeline_cleanup", cleanup)
-    scope = workflow.build_pipeline_scope("wife", scan)
+    monkeypatch.setattr(workflow, "_prepare_pipeline_cleanup_plan", prepare)
+    monkeypatch.setattr(workflow, "execute_aggregate_cleanup", aggregate)
+    scope = workflow.build_pipeline_scope("wife", scan, first_batch_size=2)
 
-    with pytest.raises(PhoneSafetyError, match="stopped after cleanup failure"):
+    with pytest.raises(PhoneSafetyError, match="aggregate cleanup failure"):
         workflow.execute_pipeline(scope, session)
 
-    assert events == [("archive", 2), ("delete", 2)]
+    assert events == [
+        ("archive", 2),
+        ("archive", 2),
+        ("archive", 1),
+        ("delete", 5),
+    ]
 
 
 def test_large_video_selection_is_any_date_strict_and_cached(

@@ -95,6 +95,7 @@ class ICloudPipelineScope:
     resume_batches: tuple[ICloudPipelineResumeBatch, ...]
     new_scan: PhotoLibraryScan
     authorization_sha256: str
+    first_batch_size: int = 50
     historical_thresholds: tuple[int, ...] = ()
 
     @property
@@ -441,6 +442,7 @@ class ICloudWorkflow:
         *,
         selection_mode: str = "age_cutoff",
         selection_threshold_bytes: int | None = None,
+        first_batch_size: int = 50,
     ) -> ICloudPipelineScope:
         """Freeze all work authorized by one interactive sync-all confirmation."""
         if selection_mode not in {"age_cutoff", "large_video"}:
@@ -451,6 +453,10 @@ class ICloudWorkflow:
             raise ValueError("age-cutoff pipeline cannot have a video size threshold")
 
         batch_size = self.config.icloud_cleanup.batch_size
+        if not 1 <= first_batch_size <= batch_size:
+            raise ValueError(
+                "first iCloud pipeline batch size must be between 1 and the configured batch size"
+            )
         cleanup_chunks: list[ICloudPipelineCleanupChunk] = []
         resume_batches: list[ICloudPipelineResumeBatch] = []
         claimed: set[str] = set()
@@ -559,6 +565,7 @@ class ICloudWorkflow:
             "cutoff_at_utc": self._cutoff(),
             "selection_threshold_bytes": selection_threshold_bytes,
             "batch_size": batch_size,
+            "first_batch_size": first_batch_size,
             "cleanup_chunks": [
                 {
                     "batch_id": chunk.batch_id,
@@ -593,6 +600,7 @@ class ICloudWorkflow:
             resume_batches=tuple(resume_batches),
             new_scan=new_scan,
             authorization_sha256=authorization_sha256,
+            first_batch_size=first_batch_size,
             historical_thresholds=tuple(sorted(historical_thresholds)),
         )
 
@@ -618,32 +626,12 @@ class ICloudWorkflow:
         if len(authorized) != scope.authorized_assets:
             raise PhoneSafetyError("the frozen iCloud pipeline scope contains duplicates")
 
-        batch_ids: list[str] = []
-        completed_chunks = 0
+        cleanup_requests: list[tuple[str, frozenset[str]]] = [
+            (chunk.batch_id, frozenset(chunk.local_identifiers))
+            for chunk in scope.cleanup_chunks
+        ]
         archived_assets = 0
-        deleted = 0
-
-        def record_batch(batch_id: str) -> None:
-            nonlocal completed_chunks
-            completed_chunks += 1
-            if batch_id not in batch_ids:
-                batch_ids.append(batch_id)
-            if batch_completed is not None:
-                batch_completed(batch_id)
-
-        for chunk in scope.cleanup_chunks:
-            result = self._execute_pipeline_cleanup(
-                chunk.batch_id,
-                frozenset(chunk.local_identifiers),
-                authorized,
-                session,
-            )
-            deleted += result["deleted"]
-            if result["failed"]:
-                raise PhoneSafetyError(
-                    f"iCloud pipeline stopped after cleanup failure in {chunk.batch_id}"
-                )
-            record_batch(chunk.batch_id)
+        first_archive_completed = False
 
         for pending in scope.resume_batches:
             self.resume_archive(pending.batch_id, session)
@@ -661,21 +649,20 @@ class ICloudWorkflow:
                     f"iCloud pipeline stopped because {pending.batch_id} is not fully verified"
                 )
             archived_assets += pending.incomplete_assets
-            result = self._execute_pipeline_cleanup(
-                pending.batch_id,
-                frozenset(pending.local_identifiers),
-                authorized,
-                session,
+            first_archive_completed = True
+            cleanup_requests.append(
+                (pending.batch_id, frozenset(pending.local_identifiers))
             )
-            deleted += result["deleted"]
-            if result["failed"]:
-                raise PhoneSafetyError(
-                    f"iCloud pipeline stopped after cleanup failure in {pending.batch_id}"
-                )
-            record_batch(pending.batch_id)
 
-        for group in batched(scope.new_scan.assets, scope.batch_size):
-            assets = tuple(group)
+        remaining_assets = list(scope.new_scan.assets)
+        while remaining_assets:
+            size = (
+                scope.batch_size
+                if first_archive_completed
+                else scope.first_batch_size
+            )
+            assets = tuple(remaining_assets[:size])
+            del remaining_assets[:size]
             subset = PhotoLibraryScan(
                 authorization=scope.new_scan.authorization,
                 assets=assets,
@@ -696,35 +683,53 @@ class ICloudWorkflow:
                     f"iCloud pipeline stopped because {archived.batch_id} is not fully verified"
                 )
             archived_assets += len(assets)
-            expected = frozenset(asset.local_identifier for asset in assets)
-            result = self._execute_pipeline_cleanup(
-                archived.batch_id,
+            first_archive_completed = True
+            cleanup_requests.append(
+                (
+                    archived.batch_id,
+                    frozenset(asset.local_identifier for asset in assets),
+                )
+            )
+
+        plans: list[ICloudCleanupPlan] = []
+        for batch_id, expected in cleanup_requests:
+            plan = self._prepare_pipeline_cleanup_plan(
+                batch_id,
                 expected,
                 authorized,
                 session,
             )
-            deleted += result["deleted"]
-            if result["failed"]:
-                raise PhoneSafetyError(
-                    f"iCloud pipeline stopped after cleanup failure in {archived.batch_id}"
-                )
-            record_batch(archived.batch_id)
+            if plan is not None:
+                plans.append(plan)
+
+        result = (
+            self.execute_aggregate_cleanup(tuple(plans), session)
+            if plans
+            else {"deleted": 0, "failed": 0}
+        )
+        if result["failed"]:
+            raise PhoneSafetyError("iCloud pipeline stopped after aggregate cleanup failure")
+
+        batch_ids = tuple(dict.fromkeys(batch_id for batch_id, _ in cleanup_requests))
+        if batch_completed is not None:
+            for batch_id in batch_ids:
+                batch_completed(batch_id)
 
         return ICloudPipelineResult(
-            batch_ids=tuple(batch_ids),
-            completed_chunks=completed_chunks,
+            batch_ids=batch_ids,
+            completed_chunks=len(plans),
             archived_assets=archived_assets,
-            deleted=deleted,
-            failed=0,
+            deleted=result["deleted"],
+            failed=result["failed"],
         )
 
-    def _execute_pipeline_cleanup(
+    def _prepare_pipeline_cleanup_plan(
         self,
         batch_id: str,
         expected: frozenset[str],
         authorized: set[str],
         session: PhotoLibrarySession,
-    ) -> dict[str, int]:
+    ) -> ICloudCleanupPlan | None:
         if not expected or not expected.issubset(authorized):
             raise PhoneSafetyError("iCloud cleanup escaped the frozen pipeline scope")
         batch = self.database.get_icloud_batch(batch_id)
@@ -737,7 +742,7 @@ class ICloudWorkflow:
                 and str(row["photos_local_id"]) in expected
             )
             if not expected:
-                return {"deleted": 0, "failed": 0}
+                return None
         plan = self.prepare_cleanup(
             batch_id,
             session,
@@ -746,7 +751,120 @@ class ICloudWorkflow:
         planned = {asset.local_identifier for asset in plan.assets}
         if planned != expected or not planned.issubset(authorized):
             raise PhoneSafetyError("iCloud deletion plan changed outside the authorized scope")
-        return self.execute_cleanup(plan, session)
+        return plan
+
+    def execute_aggregate_cleanup(
+        self,
+        plans: tuple[ICloudCleanupPlan, ...],
+        session: PhotoLibrarySession,
+    ) -> dict[str, int]:
+        """Delete multiple exact batch plans in one PhotoKit change transaction."""
+        if not plans:
+            raise PhoneSafetyError("aggregate iCloud cleanup requires at least one plan")
+        profile_ids = {plan.profile_id for plan in plans}
+        selection_modes = {plan.selection_mode for plan in plans}
+        cutoffs = {plan.cutoff_at_utc for plan in plans}
+        if len(profile_ids) != 1 or len(selection_modes) != 1 or len(cutoffs) != 1:
+            raise PhoneSafetyError(
+                "single-transaction iCloud cleanup requires one profile, selection mode, and cutoff"
+            )
+
+        assets: list[PhotoLibraryAsset] = []
+        rows_by_local_id: dict[str, Any] = {}
+        payload_plans: list[dict[str, Any]] = []
+        for plan in plans:
+            batch = self.database.get_icloud_batch(plan.batch_id)
+            payload = self._plan_payload(batch, plan.assets)
+            digest = hashlib.sha256(
+                json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+            ).hexdigest()
+            if digest != plan.plan_sha256:
+                raise PhoneSafetyError("iCloud deletion plan changed after confirmation")
+            batch_rows = {
+                str(row["photos_local_id"]): row
+                for row in self.database.list_icloud_batch_assets(plan.batch_id)
+            }
+            for asset in plan.assets:
+                if asset.local_identifier in rows_by_local_id:
+                    raise PhoneSafetyError(
+                        "the aggregate iCloud deletion plan contains duplicate assets"
+                    )
+                rows_by_local_id[asset.local_identifier] = batch_rows[
+                    asset.local_identifier
+                ]
+                assets.append(asset)
+            payload_plans.append(
+                {
+                    "batch_id": plan.batch_id,
+                    "plan_sha256": plan.plan_sha256,
+                    "local_identifiers": [
+                        asset.local_identifier for asset in plan.assets
+                    ],
+                }
+            )
+
+        aggregate_sha256 = hashlib.sha256(
+            json.dumps(payload_plans, separators=(",", ":"), sort_keys=True).encode()
+        ).hexdigest()
+        for plan in plans:
+            self.database.set_icloud_batch_state(
+                plan.batch_id,
+                "CLEANING_ICLOUD",
+                plan_sha256=plan.plan_sha256,
+                confirmed=True,
+            )
+            for asset in plan.assets:
+                self.database.set_icloud_asset_state(
+                    str(rows_by_local_id[asset.local_identifier]["batch_asset_id"]),
+                    "DELETE_INTENT",
+                )
+
+        self._progress("ICLOUD_DELETE_STARTED", assets=len(assets))
+        selection_mode = plans[0].selection_mode
+        result = session.delete(
+            tuple(assets),
+            batch_id=f"icloud-aggregate-{aggregate_sha256[:16]}",
+            cutoff_at_utc=plans[0].cutoff_at_utc,
+            plan_sha256=aggregate_sha256,
+            **(
+                {"selection_mode": selection_mode}
+                if selection_mode == "large_video"
+                else {}
+            ),
+        )
+        deleted = set(result.deleted_local_identifiers)
+        reported_failed = set(result.failed_local_identifiers)
+        for asset in assets:
+            row = rows_by_local_id[asset.local_identifier]
+            if asset.local_identifier in deleted:
+                self.database.set_icloud_asset_state(
+                    str(row["batch_asset_id"]), "DELETED"
+                )
+            else:
+                reported_failed.add(asset.local_identifier)
+                self.database.set_icloud_asset_state(
+                    str(row["batch_asset_id"]),
+                    "FAILED",
+                    error_code="ICLOUD_DELETE_FAILED",
+                    error_detail=result.failure_reason
+                    or "PhotoKit did not confirm aggregate deletion",
+                )
+
+        for plan in plans:
+            remaining = sum(
+                row["cleanup_state"] != "DELETED"
+                for row in self.database.list_icloud_batch_assets(plan.batch_id)
+            )
+            self.database.set_icloud_batch_state(
+                plan.batch_id,
+                "COMPLETED" if remaining == 0 else "COMPLETED_WITH_ITEMS_REMAINING",
+            )
+        self._progress(
+            "ICLOUD_CLEANUP_COMPLETED",
+            deleted=len(deleted),
+            failed=len(reported_failed),
+        )
+        return {"deleted": len(deleted), "failed": len(reported_failed)}
 
     def archive_all_batches(
         self,

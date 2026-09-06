@@ -64,21 +64,24 @@ PhotoKit 数据流按需测量并缓存结果。大视频批次会固化选择�
 2026-09-06 增加 iCloud 小批次模式：白天 `icloud sync` 每批最多 1000 个资产，
 归档、复核并确认后删除这一批；夜间 `archive-night` 可连续归档和验证但绝不删除；
 `cleanup-ready` 为全部已验证资产生成分块计划及汇总 SHA-256，人工确认一次后，
-严格按“最多 1000 项删除前复核 → PhotoKit 删除该批 → 下一批”循环执行。
+逐批完成删除前复核，再把兼容计划合并为一次 PhotoKit 删除事务。删除响应最长等待 24 小时，
+便于夜间完成复核后将系统弹窗保留到第二天处理。
 已验证的 PhotoKit local identifier 会跨批次排除，避免夜间重复下载。旧的大批次
 不会被 `resume` 意外继续归档。
 
 新增 `icloud sync-all` 完整流水线：初始扫描冻结候选集合并生成授权范围 SHA-256，用户
-确认一次后，程序先清理历史验证队列、恢复不超过批次上限的中断任务，再按“归档最多
-1000 项 → 精确复核并删除 → 下一批”自动循环。任何不完整归档、资产变化、计划漂移或
-删除失败都会立即停止；重新运行必须重新扫描并确认。`icloud large-video sync-all` 提供
-相同的大视频流水线，并保留历史批次各自固化的大小阈值。
+确认一次后，程序恢复不超过批次上限的中断任务，并将新候选按最多 1000 项逐批归档。
+全部归档后再逐批复核外接盘证据和 PhotoKit 身份，最后合并为一个 PhotoKit 删除事务，
+macOS 因此只收到一次系统删除请求。任何不完整归档、资产变化、计划漂移或删除失败都会
+停止；重新运行必须重新扫描并确认。`icloud large-video sync-all` 提供相同流程，并保留
+历史批次各自固化的大小阈值。两个命令的首个归档批次默认 50 项，后续恢复
+`icloud_cleanup.batch_size`，也可通过 `--first-batch-size` 调整。
 
 `icloud scan` 使用公开 PhotoKit API 枚举系统用户图库，包括云端占位资产、隐藏资产和完整连拍，不下载原件。PhotoKit 没有公开的云端资源大小元数据，所以扫描阶段只报告资产数与资源数，容量在下载归档后才确定。
 
 `icloud sync` 会按需联网下载 `PHAssetResource` 暴露的全部底层资源，沿用现有外接盘哈希、manifest 与两次稳定性验证。每个资产验证成功后会删除程序自己的 staging 临时副本。删除前再次获取精确 `localIdentifier`、检查截止时间和完整资源键集合，并把全部外接盘证据纳入 SHA-256 删除计划。PhotoKit 删除成功后，资产进入系统“最近删除”；程序不清空它，用户若需立即释放空间必须在“照片”App 手动永久删除。
 
-删除前复核采用一次完整的 SHA-256、QuickXorHash、大小和路径检查；初次归档仍保留两次稳定性检查。`cleanup-ready` 先为所有待删资产生成分块计划并让用户确认一次汇总摘要，随后严格按“最多 1000 项复核 → 删除该批 → 下一批”执行，不会先复核全部候选再开始删除。
+删除前复核采用一次完整的 SHA-256、QuickXorHash、大小和路径检查；初次归档仍保留两次稳定性检查。`cleanup-ready` 先为所有待删资产生成分块计划并让用户确认一次汇总摘要，随后逐批复核全部候选，只有全部计划兼容且通过复核后才发出一次合并删除请求。
 
 该能力已通过 fake PhotoKit session 的非破坏性测试；真实系统图库授权、扫描、iCloud 原件下载和外接盘归档已经实际运行。PhotoKit 破坏性删除尚未确认执行，因此不能宣称真实 iCloud 删除验收完成。
 
@@ -250,7 +253,7 @@ caffeinate -dimsu .venv/bin/photoarchive --config config/local.yaml \
   icloud archive-night --profile wife
 ```
 
-对全部已验证资产确认一次，然后按最多 1000 项逐批核验和删除：
+对全部已验证资产确认一次，逐批核验后通过一个 PhotoKit 事务统一删除：
 
 ```bash
 caffeinate -dimsu .venv/bin/photoarchive --config config/local.yaml \

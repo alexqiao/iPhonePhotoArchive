@@ -111,7 +111,11 @@ class SwiftPhotoLibrarySession:
         return self._error_path.read_text(encoding="utf-8").strip()
 
     def _exchange(
-        self, command: str, payload: dict[str, Any] | None = None
+        self,
+        command: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        timeout_sec: float | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         request_id = str(uuid.uuid4())
         request = {
@@ -130,7 +134,10 @@ class SwiftPhotoLibrarySession:
         records: list[dict[str, Any]] = []
         while True:
             ready, _, _ = select.select(
-                [self.stdout], [], [], self.config.command_timeout_sec
+                [self.stdout],
+                [],
+                [],
+                timeout_sec or self.config.command_timeout_sec,
             )
             if not ready:
                 raise AdapterError(f"Photos helper timed out during {command}")
@@ -259,6 +266,7 @@ class SwiftPhotoLibrarySession:
                 "selection_mode": selection_mode,
                 "assets": [_asset_reference(asset) for asset in assets],
             },
+            timeout_sec=max(self.config.command_timeout_sec, 86_400),
         )
         reason = result.get("failure_reason")
         return PhotoLibraryDeleteResult(

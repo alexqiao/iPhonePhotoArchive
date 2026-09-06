@@ -367,7 +367,8 @@ def _icloud_group_cleanup_prompt(
     )
     return (
         f"Delete {assets} verified assets ({total_bytes} archived bytes) from "
-        f"{batches} archive batches in {len(plans)} chunks? "
+        f"{batches} archive batches after revalidating {len(plans)} plans in one PhotoKit "
+        "delete transaction? "
         f"Aggregate plan SHA-256: {aggregate_sha256}.{selection_note} "
         "This affects every device using this Apple Account. Items move to Recently Deleted."
     )
@@ -387,9 +388,11 @@ def _icloud_pipeline_prompt(scope: ICloudPipelineScope) -> str:
     return (
         f"Authorize this entire sync-all run for {scope.authorized_assets} frozen iCloud Photos "
         f"assets ({scope.ready_assets} already verified, {scope.resume_assets} in resumable "
-        f"batches, {scope.new_assets} new; batch size {scope.batch_size}; {policy})? "
+        f"batches, {scope.new_assets} new; first batch {scope.first_batch_size}, "
+        f"later batches {scope.batch_size}; {policy})? "
         f"Authorization SHA-256: {scope.authorization_sha256}.{historical} "
-        "Each batch will be archived, fully revalidated, and deleted before the next batch. "
+        "All batches will be archived and fully revalidated before one combined "
+        "delete transaction. "
         "This affects every device using this Apple Account. Items move to Recently Deleted."
     )
 
@@ -786,6 +789,7 @@ def _run_icloud_sync_all(
     profile: str,
     *,
     selection_mode: str,
+    first_batch_size: int,
 ) -> None:
     config = _config(ctx)
     if not config.icloud_cleanup.enabled:
@@ -809,6 +813,7 @@ def _run_icloud_sync_all(
                 selected,
                 selection_mode=selection_mode,
                 selection_threshold_bytes=threshold,
+                first_batch_size=first_batch_size,
             )
             if not scope.authorized_assets:
                 _echo(
@@ -868,6 +873,7 @@ def _run_icloud_sync_all(
                 "completed_chunks": result.completed_chunks,
                 "deleted": result.deleted,
                 "failed": result.failed,
+                "first_batch_size": scope.first_batch_size,
                 "profile_id": profile,
                 "ready_assets": scope.ready_assets,
                 "recently_deleted_action_required": result.deleted > 0,
@@ -885,10 +891,18 @@ def _run_icloud_sync_all(
 def icloud_sync_all(
     ctx: typer.Context,
     profile: Annotated[str, typer.Option("--profile")],
+    first_batch_size: Annotated[
+        int, typer.Option("--first-batch-size", min=1)
+    ] = 50,
 ) -> None:
     """Confirm once, then archive, verify, and delete every bounded old-photo batch."""
     try:
-        _run_icloud_sync_all(ctx, profile, selection_mode="age_cutoff")
+        _run_icloud_sync_all(
+            ctx,
+            profile,
+            selection_mode="age_cutoff",
+            first_batch_size=first_batch_size,
+        )
     except typer.Abort:
         raise
     except (KeyError, OSError, RuntimeError, ValidationError, ValueError, PhotoArchiveError) as exc:
@@ -1128,10 +1142,18 @@ def icloud_large_video_sync(
 def icloud_large_video_sync_all(
     ctx: typer.Context,
     profile: Annotated[str, typer.Option("--profile")],
+    first_batch_size: Annotated[
+        int, typer.Option("--first-batch-size", min=1)
+    ] = 50,
 ) -> None:
     """Confirm once, then archive, verify, and delete every bounded large-video batch."""
     try:
-        _run_icloud_sync_all(ctx, profile, selection_mode="large_video")
+        _run_icloud_sync_all(
+            ctx,
+            profile,
+            selection_mode="large_video",
+            first_batch_size=first_batch_size,
+        )
     except typer.Abort:
         raise
     except (KeyError, OSError, RuntimeError, ValidationError, ValueError, PhotoArchiveError) as exc:
@@ -1197,7 +1219,7 @@ def icloud_cleanup_ready(
     ctx: typer.Context,
     profile: Annotated[str, typer.Option("--profile")],
 ) -> None:
-    """Confirm once, then delete all verified batches in bounded PhotoKit chunks."""
+    """Confirm once, then delete all compatible verified batches in one PhotoKit transaction."""
     try:
         config = _config(ctx)
         database = _database(config)
@@ -1243,9 +1265,7 @@ def icloud_cleanup_ready(
                         }
                     )
                     return
-                deleted = 0
-                failed = 0
-                completed_chunks = 0
+                prepared_plans: list[ICloudCleanupPlan] = []
                 for expected_plan in grouped:
                     identifiers = frozenset(
                         asset.local_identifier for asset in expected_plan.assets
@@ -1259,12 +1279,13 @@ def icloud_cleanup_ready(
                         raise PhoneSafetyError(
                             "iCloud deletion plan changed during chunk verification"
                         )
-                    result = workflow.execute_cleanup(plan, session)
-                    deleted += result["deleted"]
-                    failed += result["failed"]
-                    completed_chunks += 1
-                    if result["failed"]:
-                        break
+                    prepared_plans.append(plan)
+                result = workflow.execute_aggregate_cleanup(
+                    tuple(prepared_plans), session
+                )
+                deleted = result["deleted"]
+                failed = result["failed"]
+                completed_chunks = len(prepared_plans)
             _echo(
                 {
                     "aggregate_plan_sha256": aggregate_sha256,
@@ -1279,6 +1300,7 @@ def icloud_cleanup_ready(
                     "profile_id": profile,
                     "recently_deleted_action_required": deleted > 0,
                     "status": "completed" if failed == 0 else "stopped_after_failure",
+                    "delete_transactions": 1,
                     "total_chunks": len(grouped),
                 }
             )
