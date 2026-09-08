@@ -293,6 +293,40 @@ def test_icloud_archive_uses_bounded_batches_and_skips_verified_assets(
     assert len(database.verified_icloud_local_ids("wife")) == 5
 
 
+def test_icloud_scan_skips_assets_enumerated_but_not_refetchable(
+    app_config: AppConfig,
+) -> None:
+    config = icloud_config(app_config)
+    scan, content = multi_asset_scan(3)
+    session = FakePhotoLibrarySession(scan, content)
+    session.current.pop("asset-local-id-1")
+    database = Database(config.storage.database_path)
+    database.migrate()
+    database.create_profile("wife", "妻子")
+    progress: list[tuple[str, dict[str, object]]] = []
+    workflow = ICloudWorkflow(
+        config,
+        database,
+        FakePhotoLibraryClient(session),
+        progress=lambda event, details: progress.append((event, details)),
+    )
+
+    stable_scan, summary = workflow.scan("wife", session)
+
+    assert [asset.local_identifier for asset in stable_scan.assets] == [
+        "asset-local-id-0",
+        "asset-local-id-2",
+    ]
+    assert summary.candidate_assets == 2
+    assert summary.warnings[-1] == (
+        "PHOTOKIT_STALE_ASSETS_SKIPPED:missing=1,mismatched=0"
+    )
+    assert (
+        "ICLOUD_SCAN_STALE_ASSETS_SKIPPED",
+        {"missing": 1, "mismatched": 0},
+    ) in progress
+
+
 def test_sync_all_pipeline_archives_deletes_and_continues_in_bounded_order(
     app_config: AppConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:

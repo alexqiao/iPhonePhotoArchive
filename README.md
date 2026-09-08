@@ -71,6 +71,10 @@ caffeinate -dimsu .venv/bin/photoarchive --config config/local.yaml \
 复核或删除失败都会立即停止，重新运行时必须重新扫描并确认。首个归档批次默认 50 项，
 后续使用 `icloud_cleanup.batch_size`（默认 1000）；可通过 `--first-batch-size` 调整。
 
+初始全量扫描后，程序会按 ID 分块复核候选。对于 PhotoKit 全量枚举仍返回、但按 ID 已经
+不存在的同步残留资产，会在冻结范围前明确报告并跳过；候选冻结后才消失或变化的资产仍会
+立即阻止后续归档或删除。
+
 夜间无人值守时只归档和验证，不删除系统照片：
 
 ```bash

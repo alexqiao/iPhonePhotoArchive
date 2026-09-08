@@ -152,6 +152,49 @@ class ICloudWorkflow:
     def _cutoff(self) -> str:
         return self.config.cutoff_at_utc().isoformat().replace("+00:00", "Z")
 
+    def _stabilize_scan(
+        self,
+        session: PhotoLibrarySession,
+        scan: PhotoLibraryScan,
+        *,
+        cutoff_at_utc: str,
+        selection_mode: str = "age_cutoff",
+    ) -> PhotoLibraryScan:
+        """Drop assets that PhotoKit enumerates but cannot immediately refetch."""
+        valid_identifiers: set[str] = set()
+        missing = 0
+        mismatched = 0
+        for group in batched(scan.assets, 1000):
+            validation = session.revalidate(
+                tuple(group),
+                cutoff_at_utc=cutoff_at_utc,
+                selection_mode=selection_mode,
+            )
+            valid_identifiers.update(validation.valid_local_identifiers)
+            missing += len(validation.missing_local_identifiers)
+            mismatched += len(validation.mismatched_local_identifiers)
+        if not missing and not mismatched:
+            return scan
+        self._progress(
+            "ICLOUD_SCAN_STALE_ASSETS_SKIPPED",
+            missing=missing,
+            mismatched=mismatched,
+        )
+        return PhotoLibraryScan(
+            authorization=scan.authorization,
+            assets=tuple(
+                asset
+                for asset in scan.assets
+                if asset.local_identifier in valid_identifiers
+            ),
+            total_assets=scan.total_assets,
+            total_resources=scan.total_resources,
+            warnings=(
+                *scan.warnings,
+                f"PHOTOKIT_STALE_ASSETS_SKIPPED:missing={missing},mismatched={mismatched}",
+            ),
+        )
+
     def scan(
         self, profile_id: str, session: PhotoLibrarySession | None = None
     ) -> tuple[PhotoLibraryScan, ICloudScanSummary]:
@@ -162,6 +205,11 @@ class ICloudWorkflow:
         self._progress("ICLOUD_SCAN_STARTED", profile_id=profile_id)
         try:
             scan = active.scan(cutoff, frozenset(self.config.archive_policy.media_types))
+            scan = self._stabilize_scan(
+                active,
+                scan,
+                cutoff_at_utc=cutoff,
+            )
         finally:
             if owns_session:
                 active.close()
@@ -194,6 +242,12 @@ class ICloudWorkflow:
         self._progress("ICLOUD_LARGE_VIDEO_SCAN_STARTED", profile_id=profile_id)
         try:
             scan = active.scan_large_videos()
+            scan = self._stabilize_scan(
+                active,
+                scan,
+                cutoff_at_utc=self._cutoff(),
+                selection_mode="large_video",
+            )
         finally:
             if owns_session:
                 active.close()

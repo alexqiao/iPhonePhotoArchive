@@ -249,6 +249,10 @@ def _icloud_progress(event: str, details: dict[str, Any]) -> None:
             f"符合截止时间 {details.get('assets', 0)} 项 "
             f"({details.get('resources', 0)} 个资源); 容量需下载原件后确定"
         ),
+        "ICLOUD_SCAN_STALE_ASSETS_SKIPPED": (
+            f"扫描复核跳过 PhotoKit 幽灵资产: 已消失 {details.get('missing', 0)} 项, "
+            f"已变化 {details.get('mismatched', 0)} 项"
+        ),
         "ICLOUD_LARGE_VIDEO_SCAN_STARTED": "正在读取照片图库中的视频元数据",
         "ICLOUD_LARGE_VIDEO_SCAN_COMPLETED": (
             f"大视频扫描完成: 视频 {details.get('videos', 0)} 项; "
